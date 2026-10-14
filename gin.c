@@ -263,12 +263,12 @@ apply_gin_insert(XLogReaderState *record, Page page, int block_id)
 	memcpy(&header, XLogRecGetData(record), sizeof(header));
 	if (!(header.flags & GIN_INSERT_ISLEAF))
 	{
-		char *main = XLogRecGetData(record);
+		char *record_data = XLogRecGetData(record);
 		BlockIdData id;
 
 		if (XLogRecGetDataLen(record) < sizeof(header) + 2 * sizeof(id))
 			die("invalid GIN internal INSERT child payload");
-		memcpy(&id, main + sizeof(header) + sizeof(id), sizeof(id));
+		memcpy(&id, record_data + sizeof(header) + sizeof(id), sizeof(id));
 		right_child = BlockIdGetBlockNumber(&id);
 	}
 	data = XLogRecGetBlockData(record, 0, &len);
