@@ -8,10 +8,11 @@ This is an experimental tool for inspecting a page's history, investigating corr
 
 - Vanilla PostgreSQL **14, 15, 16, 17, and 18**. Build a separate binary with the matching major version's headers, libraries, and source tree.
 - Main-fork heap changes, including insert, update, delete, tuple locking, multi-insert, pruning, and freezing where applicable to the PostgreSQL version.
-- Full-page images for the selected block from any WAL resource manager when PostgreSQL marks the image as applicable to replay.
+- Selected incremental B-tree, Hash, GiST, GIN, SP-GiST, BRIN, Generic WAL, and Sequence changes without a full-page image. This includes B-tree and GiST page splits and updates to individual pages in multi-block WAL records. See [the coverage table](docs/usage.md#replay-boundaries) for supported variants.
+- Applicable full-page images for the selected block, including records from other WAL resource managers.
 - Explicit failure when a selected block needs an incremental WAL operation the tool cannot replay. Records for other blocks are ignored.
 
-Replay of arbitrary WAL is not possible from one page alone: some records depend on other pages or cluster state. In particular, an index change without an applicable full-page image cannot currently be replayed. Treat the output as an analysis artifact and verify it before drawing conclusions.
+The tool does not yet replay every WAL record type. For a record that changes several pages, it updates only the selected page; it does not need copies of the other pages. A matching unsupported increment stops with an error. Treat the output as an analysis artifact and verify it before drawing conclusions.
 
 ## Build
 

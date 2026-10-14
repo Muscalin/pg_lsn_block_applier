@@ -60,12 +60,28 @@ All options except the last three below are required:
 | `--segsize=BYTES` | WAL segment size; defaults to `16777216` (16 MiB). |
 | `--data-checksums` | Compute an output checksum even if the input page has none or has an invalid checksum. |
 
-Use an output path outside `PGDATA`. The output is a raw page for inspection; it is not a relation file. The tool prints each applied record and the final count. If no selected record is applied, the output may simply be the base page.
+Use an output path outside `PGDATA`. The output is a raw page for inspection; it is not a relation file. The tool prints the final count and details for selected record types, including full-page images and `MULTI_INSERT`. If no selected record is applied, the output may simply be the base page.
 
 ## Replay boundaries
 
-- Heap and Heap2 changes for the selected block are handled by version-specific code. Other resource managers can contribute an applicable full-page image. A matching incremental record from an unsupported resource manager makes the command fail instead of producing a partial result.
-- Records can refer to multiple blocks. Replaying one block does not recover related index pages, visibility maps, free-space maps, transaction status, or other cluster state.
+The following incremental changes are implemented for a matching main-fork block in PostgreSQL 14–18:
+
+| Resource manager | Supported incremental changes |
+| --- | --- |
+| Heap, Heap2 | Insert, multi-insert, update, HOT update, delete, tuple locks, confirmation, in-place update, visibility, pruning, and version-specific freeze/vacuum records. |
+| B-tree | `INSERT_LEAF`, `INSERT_UPPER`, `INSERT_META`, `INSERT_POST`, `DEDUP`, `SPLIT_L`, `SPLIT_R` (including posting-list rewrites), `NEWROOT`, `META_CLEANUP`, `MARK_PAGE_HALFDEAD`, `UNLINK_PAGE`, `UNLINK_PAGE_META`, and `DELETE`/`VACUUM`, including posting-list updates. |
+| Hash | `INIT_META_PAGE`, `INIT_BITMAP_PAGE`, `ADD_OVFL_PAGE`, `INSERT`, `MOVE_PAGE_CONTENTS`, `SQUEEZE_PAGE`, `DELETE`, `SPLIT_CLEANUP`, `UPDATE_META_PAGE`, and `VACUUM_ONE_PAGE`; old-bucket, new-bucket, and metapage changes from `SPLIT_ALLOCATE_PAGE`; bucket flags from `SPLIT_COMPLETE`. `SPLIT_PAGE` supplies the new bucket's full-page image. |
+| GiST | `PAGE_UPDATE`, including tuple deletion and replacement; `DELETE`, `PAGE_SPLIT`, and `PAGE_DELETE`, including their referenced parent or child pages. |
+| GIN | `INSERT` on entry-tree leaves and internal pages, including tuple replacement; posting-tree leaf segment recompression and internal posting-item insertion; `VACUUM_DATA_LEAF_PAGE`, `CREATE_PTREE`, `INSERT_LISTPAGE`, `UPDATE_META_PAGE`, `DELETE_LISTPAGE`, and `DELETE_PAGE`, including their selected page references. Split pages and entry-tree vacuum pages carry full-page images. |
+| SP-GiST | `ADD_LEAF`, `MOVE_LEAFS`, `ADD_NODE`, `SPLIT_TUPLE`, `PICKSPLIT`, `VACUUM_LEAF`, `VACUUM_ROOT`, and `VACUUM_REDIRECT`, including referenced parent and destination pages. |
+| BRIN | `CREATE_INDEX`, `INSERT` and `INSERT+INIT`, `UPDATE`, `SAMEPAGE_UPDATE`, `REVMAP_EXTEND`, and `DESUMMARIZE` on the relevant metapage, revmap, or regular page. |
+| Generic WAL | Byte-range deltas for the selected page, as used by extensions such as `bloom`. |
+| Sequence | `LOG` on the sequence page. PostgreSQL can reserve future values in WAL, so the resulting page can differ from the live page until crash recovery. |
+
+Applicable full-page images can restore a selected block from other resource managers. A matching incremental record outside the supported variants stops with an error rather than producing a partial result. The integration script compares replayed pages with PostgreSQL pages after WAL records without full-page images for representative variants; it does not exercise every variant in this table.
+
+- A WAL record may refer to several blocks. The program applies the change for the selected block only; the other pages are neither read nor written. The result does not include related cluster state.
+- Only the main fork is in scope. Visibility-map, free-space-map, and init forks are ignored.
 - Relation creation or truncation affecting the requested block can invalidate the base page; the tool checks for these WAL events and stops when appropriate.
 - The program does not authenticate the page's provenance or prove that the available WAL is complete. Check the result against other evidence before using it in an investigation.
 
