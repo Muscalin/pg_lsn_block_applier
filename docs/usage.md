@@ -4,10 +4,10 @@
 
 ## Inputs
 
-1. **Base page:** an exact, raw copy of the target block from before the WAL records to replay. The `--fpi` name is historical: the file can be a page extracted from a consistent, earlier relation copy or a restored full-page image. It must contain exactly one page (`BLCKSZ`, normally 8192 bytes) from the same cluster and PostgreSQL major version. Keep the base page's LSN intact.
-2. **WAL:** all segment files needed from `--start` through `--stop`, in one directory. Use the timeline and WAL segment size of the source cluster. The utility reads one specified timeline; it does not traverse timeline history.
+1. **Base page:** an exact, raw copy of the target block from before the WAL records to replay. The file can be a page extracted from a consistent, earlier relation copy or a restored full-page image. It must contain exactly one page (`BLCKSZ`, normally 8192 bytes) from the same cluster and PostgreSQL major version. Keep the base page's LSN intact.
+2. **WAL:** all segment files needed from the base page's LSN (or explicit `--start`) through `--stop`, in one directory. The utility reads the WAL segment size from the segment header. It reads one specified timeline; it does not traverse timeline history.
 3. **Target:** `--rel=T/D/R` gives the tablespace OID, database OID, and relation *file number*; `--block=N` gives the zero-based block number. Get these from the WAL block reference or the matching relation file. A SQL table OID can differ from the relation file number, and the file number can change after a rewrite.
-4. **Range:** `--start` and `--stop` are inclusive **record start LSNs**. Start at or before the first record that changes the base page, and stop at the desired record. The tool skips a record if the input page's LSN already reaches that record's end LSN. A base page from after the desired state cannot be rolled back.
+4. **Range:** `--stop` is an inclusive **record start LSN**. By default replay starts at the LSN stored in the base page, so WAL must be available from that point. For a page from `pg_waldump --save-fullpage`, pass `--start` using the FPI record LSN encoded in its filename: the page-header LSN can be much older. If `--start` is later than the page's LSN, the utility warns that intervening records may be skipped. An uninitialized page has no LSN and requires `--start`. The tool skips a record if the input page's LSN already reaches that record's end LSN. A base page from after the desired state cannot be rolled back.
 
 Use a stable, saved copy of the page and WAL. Copying a page directly from a running data directory can capture a state that does not match your chosen WAL range.
 
@@ -27,7 +27,18 @@ Use the `pg_waldump` from the same PostgreSQL major version to inspect an interv
 /path/to/pg_waldump -p /path/to/pg_wal -s 2A9C/51FB7280 -e 2A9C/51FB7E00
 ```
 
-Look for block references such as `rel 1663/24605/2072200 blk 42`. Use the `lsn:` values printed for those records to select the replay range. If the data comes from a non-default timeline or WAL segment size, carry those values into the replay command.
+Look for block references such as `rel 1663/24605/2072200 blk 42`. Use the `lsn:` values printed for those records to select the replay range. If the data comes from a non-default timeline, pass that timeline to the replay command.
+
+With PostgreSQL 16 or newer, `pg_waldump` can extract a full-page image for the selected relation and block. It is suitable as a base page when its LSN precedes the desired output state:
+
+```sh
+/path/to/pg_waldump -p /path/to/pg_wal \
+  --relation=1663/24605/2072200 --block=42 \
+  -s 2A9C/51FB7280 -e 2A9C/51FB7E00 \
+  --save-fullpage=/path/to/fpi
+```
+
+Choose the saved `*_main` file for the target block and pass it to `--base-page`. Pass the FPI record LSN in the saved filename as `--start`; do not use the older LSN stored inside the page. Keep the WAL from that record through the requested `--stop`.
 
 For a known relation in a database, PostgreSQL's `pg_relation_filepath('schema.table')` and `pg_relation_filenode('schema.table')` can help locate its current file. Verify that these identifiers correspond to the WAL interval being examined.
 
@@ -36,7 +47,7 @@ For a known relation in a database, PostgreSQL's `pg_relation_filepath('schema.t
 ```sh
 ./pg_lsn_block_applier \
   --waldir=/path/to/pg_wal \
-  --fpi=/path/to/base.page \
+  --base-page=/path/to/fpi/00000001-00002A9C-51FB7280.1663.24605.2072200.42_main \
   --out=/path/to/replayed.page \
   --rel=1663/24605/2072200 \
   --block=42 \
@@ -45,22 +56,23 @@ For a known relation in a database, PostgreSQL's `pg_relation_filepath('schema.t
   --tli=1
 ```
 
-All options except the last three below are required:
+`--waldir`, `--base-page` (or `--input`), `--out`, `--rel`, `--block`, and `--stop` are required:
 
 | Option | Meaning |
 | --- | --- |
 | `--waldir=DIR` | Directory containing the WAL segment files. |
-| `--fpi=FILE` | Earlier raw image of exactly one target page. |
+| `--base-page=FILE`, `--input=FILE` | Earlier raw image of exactly one target page. |
 | `--out=FILE` | Output page file; an existing file at this path is overwritten. |
 | `--rel=T/D/R` | Tablespace/database/relation file identifier. |
 | `--block=N` | Zero-based block number in the main fork. |
-| `--start=LSN` | First WAL record start LSN to consider. |
+| `--start=LSN` | First WAL record start LSN to consider; defaults to the base page's LSN. Use the filename LSN for a `--save-fullpage` page; required for a zero page. |
 | `--stop=LSN` | Last WAL record start LSN to consider, inclusive. |
 | `--tli=N` | Timeline ID; defaults to `1`. |
-| `--segsize=BYTES` | WAL segment size; defaults to `16777216` (16 MiB). |
 | `--data-checksums` | Compute an output checksum even if the input page has none or has an invalid checksum. |
+| `--json` | Emit newline-delimited JSON events for applied records and the final summary. |
+| `--help`, `--version` | Show usage or version and exit successfully. |
 
-Use an output path outside `PGDATA`. The output is a raw page for inspection; it is not a relation file. The tool prints the final count and details for selected record types, including full-page images and `MULTI_INSERT`. If no selected record is applied, the output may simply be the base page.
+Use an output path outside `PGDATA`. The output is a raw page for inspection; it is not a relation file. The tool prints one line per applied record and a final count. With `--json`, each stdout line is a JSON object with `event`, plus record fields (`rmgr`, `operation`, `lsn`, `end_lsn`, `rmid`, `info`, `details`) or summary fields (`applied`, `output`). Warnings and errors go to stderr. If no selected record is applied, the output may simply be the base page.
 
 ## Replay boundaries
 

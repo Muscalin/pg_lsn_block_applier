@@ -16,22 +16,24 @@ The tool does not yet replay every WAL record type. For a record that changes se
 
 ## Build
 
-You need a C compiler, `make`, a vanilla PostgreSQL source tree, and the matching PostgreSQL development headers and frontend libraries. `PG_CONFIG` must point to the same PostgreSQL major version as the source tree and WAL. Build in an environment with these dependencies, such as a container:
+You need a C compiler, `make`, a vanilla PostgreSQL source tree, and matching PostgreSQL development headers and frontend libraries. `PG_CONFIG` and `PG_SRC` must refer to the same PostgreSQL major version as the WAL; the build checks the versions in `pg_config --version` and `PG_SRC/configure.ac` before compiling. Build in an environment with these dependencies, such as a container:
 
 ```sh
 make PG_CONFIG=/path/to/pg_config PG_SRC=/path/to/postgresql-source
 ```
 
-The executable is `./pg_lsn_block_applier`. No files need to be copied into the PostgreSQL source tree.
+The executable is `./pg_lsn_block_applier`. `make clean` needs no PostgreSQL source path. To stage an installation, run `make install` with the same build variables and `DESTDIR=/path/to/staging`; it installs the binary under `bin` and `LICENSE`/`NOTICE` under `share/doc/pg_lsn_block_applier`. The default prefix is `/usr/local`.
+
+Run the integration test with `make check PG_CONFIG=/path/to/pg_config PG_SRC=/path/to/postgresql-source`. The test uses `pg_config --bindir` and the freshly built executable by default. Set `PG_BINDIR` or `BINARY` to use other paths; both are also accepted by `tests/integration.sh` when run directly.
 
 ## Example
 
-Prepare a saved image of the target page from *before* the changes you want to replay. It must contain exactly one PostgreSQL page (normally 8192 bytes). Keep the WAL segments covering the whole interval and identify the tablespace, database, relation file number, block number, and record LSNs. For example:
+Prepare a saved image of the target page from *before* the changes you want to replay. It must contain exactly one PostgreSQL page (normally 8192 bytes). Keep the WAL segments covering the whole interval and identify the tablespace, database, relation file number, block number, and record LSNs. For a page saved by `pg_waldump --save-fullpage`, use the WAL LSN encoded in its filename as `--start`:
 
 ```sh
 ./pg_lsn_block_applier \
   --waldir=/path/to/pg_wal \
-  --fpi=/path/to/base.page \
+  --base-page=/path/to/fpi/00000001-00002A9C-51FB7280.1663.24605.2072200.42_main \
   --out=/path/to/replayed.page \
   --rel=1663/24605/2072200 \
   --block=42 \
@@ -40,9 +42,9 @@ Prepare a saved image of the target page from *before* the changes you want to r
   --tli=1
 ```
 
-Here, `--rel` is `tablespace/database/relfilenode`, **not** a table OID. `--start` and `--stop` refer to WAL record start LSNs; both endpoints are included. The output is one raw page. Choose an output path outside the cluster's data directory.
+Here, `--rel` is `tablespace/database/relfilenode`, **not** a table OID. `--start` and `--stop` are inclusive WAL record start LSNs. A page saved by `pg_waldump` can contain an older page-header LSN than the FPI record named in its file. For a raw page copied from an earlier relation file, you may omit `--start` when WAL covering the page-header LSN is available. The output is one raw page. Choose an output path outside the cluster's data directory.
 
-The `--fpi` option accepts a raw page image from a saved relation file or a restored full-page image. It does not require the page to originate from WAL. Optional `--segsize=BYTES` overrides the default 16 MiB WAL segment size; `--data-checksums` requests a checksum on the output page when the input page does not carry a valid one.
+The `--base-page` option (alias `--input`) accepts a raw page image from a saved relation file or a restored full-page image. It does not require the page to originate from WAL. PostgreSQL 16 and newer can produce a base page with `pg_waldump --save-fullpage=DIR` when a suitable full-page image is present in WAL. The saved filename includes the timeline, FPI record LSN, relation and block. See [the usage guide](docs/usage.md#find-the-records) for a command. The utility reads WAL segment size from the segment header. `--data-checksums` requests a checksum on the output page when the input page does not carry a valid one. `--json` writes one JSON object per applied record and a final summary object.
 
 ## Documentation
 
@@ -50,4 +52,4 @@ See [docs/usage.md](docs/usage.md) for a step-by-step workflow, input requiremen
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+The project is distributed under Apache License 2.0; PostgreSQL-derived portions retain the PostgreSQL License notice. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
