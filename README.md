@@ -4,6 +4,8 @@
 
 This is an experimental tool for inspecting a page's history, investigating corruption, and checking what a sequence of WAL records did to a block. It does not perform cluster recovery. Its input and output are single pages, not tables or backups.
 
+This project was developed with the assistance of AI tools.
+
 ## What it supports
 
 - Vanilla PostgreSQL **14, 15, 16, 17, and 18**. Build a separate binary with the matching major version's headers, libraries, and source tree.
