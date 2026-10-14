@@ -10,15 +10,120 @@ port=$((55000 + version))
 rm -rf "$datadir"
 "$bindir/initdb" -D "$datadir" -A trust --no-sync \
     --wal-segsize="${PG_TEST_WAL_SEGSIZE:-16}" >/dev/null
+# Keep WAL from the start of this test so gaps after real page LSNs can be inspected.
+printf "wal_keep_size = '128MB'\n" >> "$datadir/postgresql.conf"
 "$bindir/pg_ctl" -D "$datadir" -o "-k /tmp -p $port -c fsync=off -c full_page_writes=off -c autovacuum=off" -l "$datadir/server.log" start >/dev/null
 trap '"$bindir/pg_ctl" -D "$datadir" stop -m immediate >/dev/null 2>&1 || true' EXIT
 
 sql() { "$bindir/psql" -X -qAt -h /tmp -p "$port" -d postgres -c "$1"; }
 
+# Audit each warning against WAL. A non-hint target record in the skipped gap
+# means the saved page is not a valid starting point for this replay case.
+start_warnings="$datadir/start-warnings.log"
+start_gap_audit="$datadir/start-gap-audit.log"
+: > "$start_warnings"
+: > "$start_gap_audit"
+audit_start_gap() {
+    python3 - "$bindir/pg_waldump" "$@" <<'PY'
+import re
+import struct
+import subprocess
+import sys
+from pathlib import Path
+
+waldump, *args = sys.argv[1:]
+options = dict(arg[2:].split('=', 1) for arg in args
+               if arg.startswith('--') and '=' in arg)
+page = Path(options['base-page']).read_bytes()
+lsn_hi, lsn_lo = struct.unpack_from('<II', page)
+page_lsn = (lsn_hi << 32) | lsn_lo
+start = options['start']
+target = (options['rel'], int(options['block']))
+
+# make_blank_page() deliberately has no LSN. Check the exact fixture bytes;
+# its --start must be supplied by the test that checks the initializing record.
+if page_lsn == 0:
+    blank = bytearray(8192)
+    struct.pack_into('<HHHH', blank, 12, 24, 8192, 8192, 8192 | 4)
+    if page != blank:
+        sys.exit(f'unverifiable --start gap: zero-LSN page is not the blank fixture: '
+                 f'{options["base-page"]}')
+    print(f'blank fixture: {options["base-page"]}')
+    sys.exit(0)
+
+page_lsn_text = f'{page_lsn >> 32:X}/{page_lsn & 0xffffffff:08X}'
+# The test is also run with Python 3.6, which has no text/capture_output kwargs.
+dump = subprocess.run([waldump, '-p', options['waldir'], '-s', page_lsn_text,
+                       '-e', start], stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE, universal_newlines=True)
+if dump.returncode:
+    sys.exit(f'cannot inspect --start gap for {options["base-page"]}: '
+             f'{dump.stderr.strip()}')
+
+block_ref = re.compile(r'blkref #\d+: rel (\d+/\d+/\d+) '
+                       r'(?:(fork \w+) )?blk (\d+)')
+target_records = []
+for line in dump.stdout.splitlines():
+    refs = block_ref.findall(line)
+    if any((rel, int(block)) == target and fork in ('', 'fork main')
+           for rel, fork, block in refs):
+        target_records.append(line)
+
+unexpected = [line for line in target_records
+              if not ('rmgr: XLOG' in line and 'desc: FPI_FOR_HINT' in line)]
+if unexpected:
+    sys.exit(f'--start skips WAL for target {target} from {page_lsn_text} '
+             f'to {start}:\n' + '\n'.join(unexpected))
+if target_records:
+    print(f'hint-only FPI gap: {options["base-page"]}')
+else:
+    print(f'no target records: {options["base-page"]}')
+PY
+}
+run_applier() {
+    applier_stderr="$datadir/applier-stderr.$$"
+    if "$binary" "$@" 2> "$applier_stderr"; then
+        if grep -q '^warning: base page LSN .* precedes --start .*; intervening WAL records may be skipped$' \
+            "$applier_stderr"; then
+            audit_start_gap "$@" >> "$start_gap_audit" || {
+                cat "$applier_stderr" >&2
+                rm -f "$applier_stderr"
+                return 1
+            }
+        fi
+        grep -E '^warning: base page LSN .* precedes --start .*; intervening WAL records may be skipped$' \
+            "$applier_stderr" >> "$start_warnings" || true
+        grep -Ev '^warning: base page LSN .* precedes --start .*; intervening WAL records may be skipped$' \
+            "$applier_stderr" >&2 || true
+        rm -f "$applier_stderr"
+    else
+        applier_status=$?
+        cat "$applier_stderr" >&2
+        rm -f "$applier_stderr"
+        return "$applier_status"
+    fi
+}
+report_start_warnings() {
+    start_warning_count=$(wc -l < "$start_warnings" | tr -d '[:space:]')
+    audit_count=$(wc -l < "$start_gap_audit" | tr -d '[:space:]')
+    test "$start_warning_count" -eq "$audit_count" || {
+        echo "--start gap audit count $audit_count differs from warning count $start_warning_count" >&2
+        exit 1
+    }
+    no_target_count=$(grep -c '^no target records:' "$start_gap_audit" || true)
+    hint_only_count=$(grep -c '^hint-only FPI gap:' "$start_gap_audit" || true)
+    blank_count=$(grep -c '^blank fixture:' "$start_gap_audit" || true)
+    test "$audit_count" -eq "$((no_target_count + hint_only_count + blank_count))" || {
+        echo 'unclassified --start gap in audit log' >&2
+        exit 1
+    }
+    printf '%s\n' "--start warnings: $audit_count; no target records: $no_target_count; hint-only FPI: $hint_only_count; blank fixtures: $blank_count; unexpected: 0 (details: $start_gap_audit)"
+}
+
 # Replay one relation block across the requested WAL interval.  Callers keep
 # their own assertions about the records and the expected page contents.
 replay_case() {
-    "$binary" --waldir="$1" --base-page="$2" --out="$3" --rel="$4" \
+    run_applier --waldir="$1" --base-page="$2" --out="$3" --rel="$4" \
         --block="$5" --start="$6" --stop="$7"
 }
 
@@ -91,6 +196,17 @@ PY
 compare_pages "$datadir/replayed.page" "$datadir/final.page"
 cat "$datadir/replay.log"
 
+# The gap audit must reject a start that omits the HOT UPDATE/INSERT WAL for
+# this target block, even though the normal replay case above starts earlier.
+if audit_start_gap --waldir="$datadir/pg_wal" --base-page="$datadir/base.page" \
+    --rel="1663/$dbid/$relid" --block=0 --start="$last_lsn" \
+    > "$datadir/skipped-target.out" 2> "$datadir/skipped-target.err"; then
+    echo 'gap audit accepted skipped target WAL' >&2
+    exit 1
+fi
+grep -q -- '--start skips WAL for target' "$datadir/skipped-target.err"
+echo 'gap audit rejects skipped target WAL'
+
 "$binary" --help > "$datadir/help.txt"
 "$binary" --version > "$datadir/version.txt"
 grep -q -- '--base-page' "$datadir/help.txt"
@@ -110,10 +226,10 @@ import sys
 events = [json.loads(line) for line in open(sys.argv[1])]
 assert events[-1]['event'] == 'done'
 assert events[-1]['applied'] == len(events) - 1
-assert all(e['event'] == 'applied' and e['lsn'] and e['end_lsn']
-           and isinstance(e['rmid'], int) and isinstance(e['info'], int)
-           and e['operation']
-           for e in events[:-1])
+for event in events[:-1]:
+    assert (event['event'] == 'applied' and event['lsn'] and event['end_lsn']
+            and isinstance(event['rmid'], int) and isinstance(event['info'], int)
+            and event['operation']), event
 assert events[-1]['applied'] > 0
 print('JSON events and default start verified')
 PY
@@ -158,6 +274,7 @@ echo 'old page LSN requires --start from available WAL'
 
 if [ "${PG_TEST_QUICK:-0}" = 1 ]; then
     echo 'basic replay and CLI checks passed'
+    report_start_warnings
     exit 0
 fi
 
@@ -272,6 +389,23 @@ replay_case "$datadir/pg_wal" "$datadir/fpi-base.page" \
     > "$datadir/fpi-replay.log"
 compare_pages "$datadir/fpi-replayed.page" "$datadir/fpi-final.page"
 cat "$datadir/fpi-replay.log"
+grep -F 'applied FPI' "$datadir/fpi-replay.log" >/dev/null
+run_applier --waldir="$datadir/pg_wal" --base-page="$datadir/fpi-base.page" \
+    --out="$datadir/fpi-json.page" --rel="1663/$dbid/$relid" \
+    --block=0 --start="$start" --stop="$last_lsn" --json \
+    > "$datadir/fpi-replay.jsonl"
+compare_pages "$datadir/fpi-json.page" "$datadir/fpi-final.page"
+python3 - "$datadir/fpi-replay.jsonl" <<'PY'
+import json
+import sys
+
+events = [json.loads(line) for line in open(sys.argv[1])]
+assert any(event['event'] == 'applied' and event['rmgr'] == 'FPI'
+           and event['operation'] == 'FPI' for event in events[:-1]), events
+assert events[-1]['event'] == 'done'
+assert events[-1]['applied'] == len(events) - 1
+print('FPI JSON event verified')
+PY
 
 "$bindir/pg_ctl" -D "$datadir" stop -m fast >/dev/null
 "$bindir/pg_ctl" -D "$datadir" -o "-k /tmp -p $port -c fsync=off -c full_page_writes=off -c autovacuum=off" -l "$datadir/server.log" start >/dev/null
@@ -346,11 +480,26 @@ else
 fi
 grep 'rmgr: Heap2' "$datadir/vacuum-layout-records.txt" |
     grep -F "desc: $vacuum_op" | grep -F "rel 1663/$dbid/$relid blk 0" >/dev/null
+target_records=$(grep -F "rel 1663/$dbid/$relid blk 0" \
+    "$datadir/vacuum-layout-records.txt")
+replay_start=$start
+case "$(printf '%s\n' "$target_records" | head -1)" in
+    *'desc: FPI_FOR_HINT'*)
+        # PG14 can log a hint-bit FPI for this page before the VACUUM redo.
+        # The comparison masks hints; start at the first real page change so
+        # the test still exercises the incremental cleanup record.
+        replay_start=$(printf '%s\n' "$target_records" |
+            grep -v 'desc: FPI_FOR_HINT' | head -1 |
+            sed -n 's/.*lsn: \([0-9A-F]*\/[0-9A-F]*\),.*/\1/p')
+        test -n "$replay_start"
+        echo 'VACUUM layout: skipped preceding hint-only FPI'
+        ;;
+esac
 last_lsn=$(grep -F "rel 1663/$dbid/$relid blk 0" "$datadir/vacuum-layout-records.txt" |
     tail -1 | sed -n 's/.*lsn: \([0-9A-F]*\/[0-9A-F]*\),.*/\1/p')
 test -n "$last_lsn"
 replay_case "$datadir/pg_wal" "$datadir/vacuum-layout-base.page" \
-    "$datadir/vacuum-layout-replayed.page" "1663/$dbid/$relid" "0" "$start" "$last_lsn" \
+    "$datadir/vacuum-layout-replayed.page" "1663/$dbid/$relid" "0" "$replay_start" "$last_lsn" \
     > "$datadir/vacuum-layout-replay.log"
 grep -F "applied Heap2 $vacuum_log_op" "$datadir/vacuum-layout-replay.log" >/dev/null
 if grep -F 'applied FPI' "$datadir/vacuum-layout-replay.log" >/dev/null; then
@@ -1733,3 +1882,4 @@ sql 'CHECKPOINT' >/dev/null
 dd if="$datadir/$relpath" of="$datadir/sequence-final.page" bs=8192 count=1 status=none
 compare_index_pages "$datadir/sequence-replayed.page" "$datadir/sequence-final.page"
 cat "$datadir/sequence-replay.log"
+report_start_warnings

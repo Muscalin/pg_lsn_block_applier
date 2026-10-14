@@ -156,7 +156,7 @@ log_applied(XLogReaderState *record, const char *rmgr,
 		printf("{\"event\":\"applied\",\"rmgr\":");
 		print_json_string(rmgr);
 		printf(",\"operation\":");
-		print_json_string(operation);
+		print_json_string(operation[0] != '\0' ? operation : rmgr);
 		printf(",\"lsn\":");
 		print_json_string(lsnbuf);
 		printf(",\"end_lsn\":");
