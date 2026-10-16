@@ -1164,7 +1164,7 @@ main(int argc, char **argv)
 				usage(argv[0], stdout);
 				return EXIT_SUCCESS;
 			case 13:
-				printf("pg_lsn_block_applier 0.1.0 (PostgreSQL %s)\n", PG_VERSION);
+				printf("pg_lsn_block_applier 0.1.1 (PostgreSQL %s)\n", PG_VERSION);
 				return EXIT_SUCCESS;
 			default:
 				usage(argv[0], stderr);
