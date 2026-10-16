@@ -5,15 +5,28 @@ version=$1
 bindir=${PG_BINDIR:-/usr/lib/postgresql/$version/bin}
 binary=${BINARY:-/tmp/pg_lsn_block_applier_$version}
 datadir=/tmp/pg_lsn_block_applier_data_$version
+rollover_datadir=/tmp/pg_lsn_block_applier_rollover_$version
+rollover_started=0
 port=$((55000 + version))
 
 rm -rf "$datadir"
-"$bindir/initdb" -D "$datadir" -A trust --no-sync \
-    --wal-segsize="${PG_TEST_WAL_SEGSIZE:-16}" >/dev/null
+if [ "${PG_TEST_FORCE_CHECKSUMS:-0}" = 1 ]; then
+    "$bindir/initdb" -D "$datadir" -A trust --no-sync --data-checksums \
+        --wal-segsize="${PG_TEST_WAL_SEGSIZE:-16}" >/dev/null
+else
+    "$bindir/initdb" -D "$datadir" -A trust --no-sync \
+        --wal-segsize="${PG_TEST_WAL_SEGSIZE:-16}" >/dev/null
+fi
 # Keep WAL from the start of this test so gaps after real page LSNs can be inspected.
 printf "wal_keep_size = '128MB'\n" >> "$datadir/postgresql.conf"
 "$bindir/pg_ctl" -D "$datadir" -o "-k /tmp -p $port -c fsync=off -c full_page_writes=off -c autovacuum=off" -l "$datadir/server.log" start >/dev/null
-trap '"$bindir/pg_ctl" -D "$datadir" stop -m immediate >/dev/null 2>&1 || true' EXIT
+stop_test_clusters() {
+    "$bindir/pg_ctl" -D "$datadir" stop -m immediate >/dev/null 2>&1 || true
+    if [ "$rollover_started" -eq 1 ]; then
+        "$bindir/pg_ctl" -D "$rollover_datadir" stop -m immediate >/dev/null 2>&1 || true
+    fi
+}
+trap stop_test_clusters EXIT
 
 sql() { "$bindir/psql" -X -qAt -h /tmp -p "$port" -d postgres -c "$1"; }
 
@@ -213,6 +226,34 @@ grep -q -- '--base-page' "$datadir/help.txt"
 grep -q -- '--start=2A9C/51FB7280' "$datadir/help.txt"
 grep -q 'pg_lsn_block_applier' "$datadir/version.txt"
 
+# Invalid CLI values must fail before replay and must never create a page.
+expect_cli_error() {
+    case_name=$1
+    expected=$2
+    shift 2
+    out="$datadir/cli-$case_name.page"
+    if "$binary" --waldir="$datadir/pg_wal" --base-page="$datadir/base.page" \
+        --out="$out" --rel="1663/$dbid/$relid" --block=0 \
+        --stop="$last_lsn" "$@" \
+        > "$datadir/cli-$case_name.out" 2> "$datadir/cli-$case_name.err"; then
+        echo "invalid CLI case $case_name unexpectedly succeeded" >&2
+        exit 1
+    fi
+    grep -F -- "$expected" "$datadir/cli-$case_name.err" >/dev/null
+    test ! -e "$out"
+}
+expect_cli_error rel_short 'invalid --rel value:' "--rel=1663/$dbid"
+expect_cli_error rel_suffix 'invalid --rel value:' "--rel=1663/$dbid/${relid}junk"
+expect_cli_error block_text 'invalid --block value:' '--block=abc'
+expect_cli_error block_suffix 'invalid --block value:' '--block=0junk'
+expect_cli_error start_lsn 'invalid --start LSN:' '--start=not-an-lsn'
+expect_cli_error start_hex_prefix 'invalid --start LSN:' '--start=0x1A/0'
+expect_cli_error stop_lsn 'invalid --stop LSN:' '--stop=0/nothex'
+expect_cli_error tli_zero '--tli must be greater than zero' '--tli=0'
+expect_cli_error reversed_lsn '--stop must be >= --start' \
+    "--start=$last_lsn" "--stop=$start"
+echo 'nine invalid CLI cases rejected without output pages'
+
 # Omitted --start uses the page header LSN.  Exercise the --input alias and
 # require exactly one JSON event for each applied record plus the summary.
 "$binary" --waldir="$datadir/pg_wal" --input="$datadir/base.page" \
@@ -271,6 +312,228 @@ test ! -e "$datadir/old-lsn-failed.page"
     > /dev/null 2> "$datadir/old-lsn-with-start.err"
 compare_pages "$datadir/old-lsn-replayed.page" "$datadir/final.page"
 echo 'old page LSN requires --start from available WAL'
+
+# An explicit timeline must select the same WAL as the default.  A different
+# timeline and a directory without a segment for the requested LSN must fail
+# before creating an output page.
+"$binary" --waldir="$datadir/pg_wal" --base-page="$datadir/base.page" \
+    --out="$datadir/tli-replayed.page" --rel="1663/$dbid/$relid" \
+    --block=0 --stop="$last_lsn" --tli=1 > "$datadir/tli-replay.log"
+cmp "$datadir/tli-replayed.page" "$datadir/json-replayed.page"
+if "$binary" --waldir="$datadir/pg_wal" --base-page="$datadir/base.page" \
+    --out="$datadir/wrong-tli.page" --rel="1663/$dbid/$relid" \
+    --block=0 --stop="$last_lsn" --tli=2 \
+    > "$datadir/wrong-tli.out" 2> "$datadir/wrong-tli.err"; then
+    echo 'replay unexpectedly accepted WAL from another timeline' >&2
+    exit 1
+fi
+grep -q 'could not find a valid WAL segment on timeline 2 containing start LSN' \
+    "$datadir/wrong-tli.err"
+test ! -e "$datadir/wrong-tli.page"
+
+mkdir "$datadir/no-wal"
+printf '%s\n' 'not a WAL segment' > "$datadir/no-wal/README"
+# Use a real long page header as a template: one fake has the wrong magic,
+# and the other has a valid header whose page address disagrees with its name.
+header_source=$(sql "SELECT pg_walfile_name('$start'::pg_lsn)")
+python3 - "$datadir/pg_wal/$header_source" "$datadir/no-wal" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+with open(sys.argv[1], 'rb') as source:
+    header = bytearray(source.read(8192))
+assert len(header) == 8192
+assert struct.unpack_from('<H', header, 0)[0] != 0
+segment_size = struct.unpack_from('<I', header, 32)[0]
+assert segment_size > 0
+assert struct.unpack_from('<Q', header, 8)[0] != 0xF1 * segment_size
+wrong_magic = bytearray(header)
+struct.pack_into('<H', wrong_magic, 0, 0)
+directory = Path(sys.argv[2])
+(directory / '0000000100000000000000F0').write_bytes(wrong_magic)
+(directory / '0000000100000000000000F1').write_bytes(header)
+PY
+if "$binary" --waldir="$datadir/no-wal" --base-page="$datadir/base.page" \
+    --out="$datadir/no-wal.page" --rel="1663/$dbid/$relid" \
+    --block=0 --stop="$last_lsn" \
+    > "$datadir/no-wal.out" 2> "$datadir/no-wal.err"; then
+    echo 'replay unexpectedly accepted a directory without WAL' >&2
+    exit 1
+fi
+grep -q 'could not find a valid WAL segment on timeline 1 containing start LSN' \
+    "$datadir/no-wal.err"
+test ! -e "$datadir/no-wal.page"
+
+# Header-based segment-size detection must skip ordinary files, suffixes,
+# directories, and a segment-shaped filename with a short header.
+mkdir "$datadir/mixed-wal" "$datadir/mixed-wal/archive_status"
+printf '%s\n' 'not WAL' > "$datadir/mixed-wal/README"
+printf '%s\n' 'not WAL' > "$datadir/mixed-wal/000000010000000000000000"
+printf '%s\n' 'not WAL' > "$datadir/mixed-wal/000000010000000000000001.partial"
+for segment in "$datadir"/pg_wal/????????????????????????; do
+    test -f "$segment" || continue
+    ln -s "$segment" "$datadir/mixed-wal/$(basename "$segment")"
+done
+"$binary" --waldir="$datadir/mixed-wal" --base-page="$datadir/base.page" \
+    --out="$datadir/mixed-wal-replayed.page" --rel="1663/$dbid/$relid" \
+    --block=0 --stop="$last_lsn" > "$datadir/mixed-wal-replay.log"
+cmp "$datadir/mixed-wal-replayed.page" "$datadir/json-replayed.page"
+
+# The first WAL segment is valid, but the next one is absent from the archive.
+# A real switch and INSERT ensure that replay must open the missing segment.
+sql 'CREATE TABLE replay_wal_gap (id integer) WITH (autovacuum_enabled=false)' >/dev/null
+sql 'INSERT INTO replay_wal_gap VALUES (1)' >/dev/null
+sql 'CHECKPOINT' >/dev/null
+gap_relpath=$(sql "SELECT pg_relation_filepath('replay_wal_gap')")
+gap_relid=$(sql "SELECT pg_relation_filenode('replay_wal_gap')")
+dd if="$datadir/$gap_relpath" of="$datadir/wal-gap-base.page" \
+    bs=8192 count=1 status=none
+gap_start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+gap_start_segment=$(sql "SELECT pg_walfile_name('$gap_start'::pg_lsn)")
+sql 'SELECT pg_switch_wal()' >/dev/null
+sql 'INSERT INTO replay_wal_gap VALUES (2)' >/dev/null
+gap_stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CHECKPOINT' >/dev/null
+dd if="$datadir/$gap_relpath" of="$datadir/wal-gap-final.page" \
+    bs=8192 count=1 status=none
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$gap_start" -e "$gap_stop" \
+    > "$datadir/wal-gap-records.txt"
+gap_insert_lsn=$(grep 'rmgr: Heap' "$datadir/wal-gap-records.txt" |
+    grep 'desc: INSERT ' | grep -F "rel 1663/$dbid/$gap_relid blk 0" | tail -1 |
+    sed -n 's/.*lsn: \([0-9A-F]*\/[0-9A-F]*\),.*/\1/p')
+test -n "$gap_insert_lsn"
+gap_missing_segment=$(sql "SELECT pg_walfile_name('$gap_insert_lsn'::pg_lsn)")
+test "$gap_start_segment" != "$gap_missing_segment"
+replay_case "$datadir/pg_wal" "$datadir/wal-gap-base.page" \
+    "$datadir/wal-gap-complete.page" "1663/$dbid/$gap_relid" 0 \
+    "$gap_start" "$gap_insert_lsn" > "$datadir/wal-gap-complete.log"
+compare_pages "$datadir/wal-gap-complete.page" "$datadir/wal-gap-final.page"
+mkdir "$datadir/wal-gap-archive"
+ln -s "$datadir/pg_wal/$gap_start_segment" \
+    "$datadir/wal-gap-archive/$gap_start_segment"
+if "$binary" --waldir="$datadir/wal-gap-archive" \
+    --base-page="$datadir/wal-gap-base.page" \
+    --out="$datadir/wal-gap-missing.page" --rel="1663/$dbid/$gap_relid" \
+    --block=0 --start="$gap_start" --stop="$gap_insert_lsn" \
+    > "$datadir/wal-gap-missing.out" 2> "$datadir/wal-gap-missing.err"; then
+    echo 'replay unexpectedly crossed a missing WAL segment' >&2
+    exit 1
+fi
+grep -F "could not open WAL file \"$datadir/wal-gap-archive/$gap_missing_segment\"" \
+    "$datadir/wal-gap-missing.err" >/dev/null
+test ! -e "$datadir/wal-gap-missing.page"
+echo 'missing WAL segment inside replay interval detected'
+
+# Clear the input checksum so the option is exercised on every PG version,
+# including versions whose initdb enables checksums by default.
+python3 - "$datadir/base.page" "$datadir/no-checksum-base.page" <<'PY'
+import sys
+from pathlib import Path
+
+page = bytearray(Path(sys.argv[1]).read_bytes())
+page[8:10] = b'\0\0'
+Path(sys.argv[2]).write_bytes(page)
+PY
+"$binary" --waldir="$datadir/pg_wal" --base-page="$datadir/no-checksum-base.page" \
+    --out="$datadir/no-checksum-replayed.page" --rel="1663/$dbid/$relid" \
+    --block=0 --stop="$last_lsn" > "$datadir/no-checksum-replay.log"
+"$binary" --waldir="$datadir/pg_wal" --base-page="$datadir/no-checksum-base.page" \
+    --out="$datadir/checksum-replayed.page" --rel="1663/$dbid/$relid" \
+    --block=0 --stop="$last_lsn" --data-checksums \
+    > "$datadir/checksum-replay.log"
+python3 - "$datadir/no-checksum-replayed.page" "$datadir/checksum-replayed.page" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+plain, checked = (bytearray(Path(path).read_bytes()) for path in sys.argv[1:])
+assert len(plain) == len(checked) == 8192
+stored = struct.unpack_from('<H', checked, 8)[0]
+assert struct.unpack_from('<H', plain, 8)[0] == 0
+checked[8:10] = b'\0\0'
+assert plain == checked, 'checksum option changed more than pd_checksum'
+
+# PostgreSQL's 32-lane checksum algorithm from storage/checksum_impl.h.
+offsets = [
+    0x5B1F36E9, 0xB8525960, 0x02AB50AA, 0x1DE66D2A,
+    0x79FF467A, 0x9BB9F8A3, 0x217E7CD2, 0x83E13D2C,
+    0xF8D4474F, 0xE39EB970, 0x42C6AE16, 0x993216FA,
+    0x7B093B5D, 0x98DAFF3C, 0xF718902A, 0x0B1C9CDB,
+    0xE58F764B, 0x187636BC, 0x5D7B3BB1, 0xE73DE7DE,
+    0x92BEC979, 0xCCA6C0B2, 0x304A0979, 0x85AA43D4,
+    0x783125BB, 0x6CA8EAA2, 0xE407EAC6, 0x4B5CFC3E,
+    0x9FBF8C76, 0x15CA20BE, 0xF2CA9FD3, 0x959BD756,
+]
+for n, word in enumerate(struct.unpack('<2048I', checked)):
+    lane = n % 32
+    value = offsets[lane] ^ word
+    offsets[lane] = ((value * 16777619) & 0xffffffff) ^ (value >> 17)
+for _ in range(2):
+    for lane, value in enumerate(offsets):
+        offsets[lane] = ((value * 16777619) & 0xffffffff) ^ (value >> 17)
+checksum = 0
+for value in offsets:
+    checksum ^= value
+assert stored == checksum % 65535 + 1, (stored, checksum % 65535 + 1)
+print('timeline, missing and unrelated WAL files, and output checksum verified')
+PY
+
+# A stale page cannot be replayed across creation of a relation with the
+# requested file locator.  The saved page stands in for an old incarnation.
+boundary_start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CREATE TABLE replay_boundary_test (payload text) WITH (autovacuum_enabled=false)' >/dev/null
+boundary_relid=$(sql "SELECT pg_relation_filenode('replay_boundary_test')")
+boundary_relpath=$(sql "SELECT pg_relation_filepath('replay_boundary_test')")
+sql 'CHECKPOINT' >/dev/null
+boundary_stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$boundary_start" -e "$boundary_stop" \
+    > "$datadir/boundary-create-records.txt"
+create_lsn=$(grep -F "desc: CREATE base/$dbid/$boundary_relid" \
+    "$datadir/boundary-create-records.txt" | head -1 |
+    sed -n 's/.*lsn: \([0-9A-F]*\/[0-9A-F]*\),.*/\1/p')
+test -n "$create_lsn"
+if "$binary" --waldir="$datadir/pg_wal" --base-page="$datadir/base.page" \
+    --out="$datadir/recreated.page" --rel="1663/$dbid/$boundary_relid" \
+    --block=0 --stop="$create_lsn" \
+    > "$datadir/recreated.out" 2> "$datadir/recreated.err"; then
+    echo 'replay crossed relation creation' >&2
+    exit 1
+fi
+grep -F "target relation was recreated at LSN $create_lsn" \
+    "$datadir/recreated.err" >/dev/null
+test ! -e "$datadir/recreated.page"
+
+# VACUUM truncates a heap file without changing its relfilenode.  Select a
+# block beyond the resulting EOF and require a specific truncation error.
+sql "INSERT INTO replay_boundary_test SELECT repeat('x', 500) FROM generate_series(1, 5000)" >/dev/null
+sql 'CHECKPOINT' >/dev/null
+dd if="$datadir/$boundary_relpath" of="$datadir/truncated-base.page" \
+    bs=8192 skip=1 count=1 status=none
+test "$(wc -c < "$datadir/truncated-base.page")" -eq 8192
+truncate_start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'DELETE FROM replay_boundary_test' >/dev/null
+sql 'VACUUM (TRUNCATE ON) replay_boundary_test' >/dev/null
+sql 'CHECKPOINT' >/dev/null
+truncate_stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$truncate_start" -e "$truncate_stop" \
+    > "$datadir/boundary-truncate-records.txt"
+truncate_lsn=$(grep -F "desc: TRUNCATE base/$dbid/$boundary_relid to" \
+    "$datadir/boundary-truncate-records.txt" | tail -1 |
+    sed -n 's/.*lsn: \([0-9A-F]*\/[0-9A-F]*\),.*/\1/p')
+test -n "$truncate_lsn"
+if "$binary" --waldir="$datadir/pg_wal" \
+    --base-page="$datadir/truncated-base.page" \
+    --out="$datadir/truncated.page" --rel="1663/$dbid/$boundary_relid" \
+    --block=1 --start="$truncate_start" --stop="$truncate_lsn" \
+    > "$datadir/truncated.out" 2> "$datadir/truncated.err"; then
+    echo 'replay crossed truncation of the target block' >&2
+    exit 1
+fi
+grep -F "target heap block was truncated at LSN $truncate_lsn" \
+    "$datadir/truncated.err" >/dev/null
+test ! -e "$datadir/truncated.page"
+echo 'relation creation and truncation stop replay without writing a page'
 
 if [ "${PG_TEST_QUICK:-0}" = 1 ]; then
     echo 'basic replay and CLI checks passed'
@@ -435,6 +698,62 @@ check_prune_xid_unchanged "$datadir/copy-base.page" \
     "$datadir/copy-replayed.page" "$datadir/copy-final.page"
 cat "$datadir/copy-replay.log"
 
+# PG14's PageRepairFragmentation leaves trailing LP_UNUSED pointers in place.
+# A deleted HOT chain leaves an unused pointer at the end of a heap page.
+# Replay its on-access PRUNE incrementally and check the retained pointer.
+if [ "$version" -eq 14 ]; then
+    sql 'CREATE TABLE replay_prune_tail (id integer, payload text) WITH (fillfactor=100, autovacuum_enabled=false)' >/dev/null
+    sql "INSERT INTO replay_prune_tail SELECT n, repeat('x', 100) FROM generate_series(1, 100) AS n" >/dev/null
+    tail_id=$(sql "SELECT max(id) FROM replay_prune_tail WHERE ctid::text LIKE '(0,%'")
+    test -n "$tail_id"
+    sql "UPDATE replay_prune_tail SET payload = 'y' WHERE id = $tail_id" >/dev/null
+    case "$(sql "SELECT ctid::text FROM replay_prune_tail WHERE id = $tail_id")" in
+        '(0,'*) ;;
+        *) echo 'PG14 prune-tail HOT update left block 0' >&2; exit 1 ;;
+    esac
+    sql "DELETE FROM replay_prune_tail WHERE id = $tail_id" >/dev/null
+    sql 'CHECKPOINT' >/dev/null
+    relpath=$(sql "SELECT pg_relation_filepath('replay_prune_tail')")
+    relid=$(sql "SELECT pg_relation_filenode('replay_prune_tail')")
+    dd if="$datadir/$relpath" of="$datadir/prune-tail-base.page" bs=8192 count=1 status=none
+    start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+    sql 'SELECT count(*) FROM replay_prune_tail' >/dev/null
+    stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+    sql 'CHECKPOINT' >/dev/null
+    dd if="$datadir/$relpath" of="$datadir/prune-tail-final.page" bs=8192 count=1 status=none
+    "$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/prune-tail-records.txt"
+    prune_record=$(grep 'rmgr: Heap2' "$datadir/prune-tail-records.txt" |
+        grep 'desc: PRUNE' | grep -F "rel 1663/$dbid/$relid blk 0" | head -1)
+    test -n "$prune_record" || { echo 'PG14 did not emit on-access PRUNE for trailing line pointer' >&2; exit 1; }
+    prune_lsn=$(printf '%s\n' "$prune_record" |
+        sed -n 's/.*lsn: \([0-9A-F]*\/[0-9A-F]*\),.*/\1/p')
+    # A scan can WAL-log a hint-only FPI before PRUNE even with
+    # full_page_writes=off.  The base page already has the required tuple
+    # state; replay the PRUNE record itself to test its incremental redo.
+    replay_case "$datadir/pg_wal" "$datadir/prune-tail-base.page" \
+        "$datadir/prune-tail-replayed.page" "1663/$dbid/$relid" 0 "$prune_lsn" "$prune_lsn" \
+        > "$datadir/prune-tail-replay.log"
+    grep -F 'applied Heap2 PRUNE:' "$datadir/prune-tail-replay.log" >/dev/null
+    if grep -F 'applied FPI' "$datadir/prune-tail-replay.log" >/dev/null; then
+        echo 'PG14 prune-tail test replayed an FPI' >&2
+        exit 1
+    fi
+    compare_pages "$datadir/prune-tail-replayed.page" "$datadir/prune-tail-final.page"
+    python3 - "$datadir/prune-tail-base.page" "$datadir/prune-tail-final.page" <<'PY'
+import struct
+import sys
+
+base, final = [open(path, 'rb').read() for path in sys.argv[1:]]
+base_lower = struct.unpack_from('<H', base, 12)[0]
+final_lower = struct.unpack_from('<H', final, 12)[0]
+assert base_lower == final_lower and base_lower > 24, (base_lower, final_lower)
+last_item = struct.unpack_from('<I', final, final_lower - 4)[0]
+assert (last_item >> 15) & 3 == 0, last_item  # LP_UNUSED remains on PG14
+print('PG14 PRUNE retains trailing unused line pointer')
+PY
+    cat "$datadir/prune-tail-replay.log"
+fi
+
 # VACUUM's second pass only marks dead line pointers unused.  An earlier
 # on-access prune followed by insertion leaves live tuples out of line-pointer
 # order, making an accidental page compaction visible in their lp_off values.
@@ -585,7 +904,7 @@ PY
 cat "$datadir/index-insert-replay.log"
 
 compare_index_pages() {
-python3 - "$1" "$2" "${3:-}" <<'PY'
+python3 - "$1" "$2" <<'PY'
 import struct
 import sys
 
@@ -596,9 +915,6 @@ def normalized(path):
     assert 24 <= lower <= upper <= 8192
     page[8:10] = b'\0\0'  # checksum
     page[lower:upper] = bytes(upper - lower)  # unallocated tuple space
-    if sys.argv[3] == 'gist':
-        special = struct.unpack_from('<H', page, 16)[0]
-        page[special + 12] &= ~0x04  # GiST's tuple-deleted hint has no WAL record
     return page
 
 left, right = normalized(sys.argv[1]), normalized(sys.argv[2])
@@ -617,6 +933,200 @@ struct.pack_into('<HHHH', page, 12, 24, 8192, 8192, 8192 | 4)
 open(sys.argv[1], 'wb').write(page)
 PY
 }
+
+# Exercise heap branches that are easy to lose behind ordinary INSERT/UPDATE
+# tests: tuple locks, speculative insertion confirmation, and INIT_PAGE.
+sql 'CREATE TABLE replay_heap_branches (id integer PRIMARY KEY, value text) WITH (autovacuum_enabled=false)' >/dev/null
+sql "INSERT INTO replay_heap_branches VALUES (1, 'seed')" >/dev/null
+sql 'CHECKPOINT' >/dev/null
+relpath=$(sql "SELECT pg_relation_filepath('replay_heap_branches')")
+relid=$(sql "SELECT pg_relation_filenode('replay_heap_branches')")
+dd if="$datadir/$relpath" of="$datadir/heap-branches-base.page" bs=8192 count=1 status=none
+start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'BEGIN; SELECT id FROM replay_heap_branches WHERE id=1 FOR UPDATE; COMMIT;' >/dev/null
+sql "INSERT INTO replay_heap_branches VALUES (2, 'confirmed') ON CONFLICT DO NOTHING" >/dev/null
+stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CHECKPOINT' >/dev/null
+dd if="$datadir/$relpath" of="$datadir/heap-branches-final.page" bs=8192 count=1 status=none
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/heap-branches-records.txt"
+grep 'rmgr: Heap ' "$datadir/heap-branches-records.txt" |
+    grep 'desc: LOCK ' | grep -F "rel 1663/$dbid/$relid blk 0" >/dev/null
+grep 'rmgr: Heap ' "$datadir/heap-branches-records.txt" |
+    grep 'desc: HEAP_CONFIRM ' | grep -F "rel 1663/$dbid/$relid blk 0" >/dev/null
+lock_lsn=$(grep 'rmgr: Heap ' "$datadir/heap-branches-records.txt" |
+    grep 'desc: LOCK ' | grep -F "rel 1663/$dbid/$relid blk 0" |
+    head -1 | sed -n 's/.*lsn: \([0-9A-F]*\/[0-9A-F]*\),.*/\1/p')
+test -n "$lock_lsn"
+# With checksums enabled, the SELECT can log a hint-bit FPI before LOCK.
+# Start at LOCK so the test still verifies the incremental redo path.
+replay_case "$datadir/pg_wal" "$datadir/heap-branches-base.page" \
+    "$datadir/heap-branches-replayed.page" "1663/$dbid/$relid" 0 "$lock_lsn" "$stop" \
+    > "$datadir/heap-branches-replay.log"
+grep -F 'applied Heap LOCK ' "$datadir/heap-branches-replay.log" >/dev/null
+grep -F 'applied Heap CONFIRM ' "$datadir/heap-branches-replay.log" >/dev/null
+if grep -F 'applied FPI' "$datadir/heap-branches-replay.log" >/dev/null; then
+    echo 'Heap LOCK/CONFIRM test replayed an FPI' >&2
+    exit 1
+fi
+compare_pages "$datadir/heap-branches-replayed.page" "$datadir/heap-branches-final.page"
+tail -4 "$datadir/heap-branches-replay.log"
+
+sql 'CREATE TABLE replay_heap_init (id integer) WITH (autovacuum_enabled=false)' >/dev/null
+relpath=$(sql "SELECT pg_relation_filepath('replay_heap_init')")
+relid=$(sql "SELECT pg_relation_filenode('replay_heap_init')")
+make_blank_page "$datadir/heap-init-base.page"
+start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'INSERT INTO replay_heap_init VALUES (1)' >/dev/null
+stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CHECKPOINT' >/dev/null
+dd if="$datadir/$relpath" of="$datadir/heap-init-final.page" bs=8192 count=1 status=none
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/heap-init-records.txt"
+grep 'rmgr: Heap ' "$datadir/heap-init-records.txt" |
+    grep 'desc: INSERT+INIT ' | grep -F "rel 1663/$dbid/$relid blk 0" >/dev/null
+replay_case "$datadir/pg_wal" "$datadir/heap-init-base.page" \
+    "$datadir/heap-init-replayed.page" "1663/$dbid/$relid" 0 "$start" "$stop" \
+    > "$datadir/heap-init-replay.log"
+grep -F 'applied Heap INSERT ' "$datadir/heap-init-replay.log" >/dev/null
+if grep -F 'applied FPI' "$datadir/heap-init-replay.log" >/dev/null; then
+    echo 'Heap INIT_PAGE test replayed an FPI' >&2
+    exit 1
+fi
+compare_pages "$datadir/heap-init-replayed.page" "$datadir/heap-init-final.page"
+tail -2 "$datadir/heap-init-replay.log"
+
+# VACUUM ANALYZE updates pg_class statistics in place.  Select the catalog
+# block containing this table's row before taking the base-page snapshot.
+sql 'CREATE TABLE replay_inplace (id integer, value text) WITH (autovacuum_enabled=false)' >/dev/null
+sql "INSERT INTO replay_inplace SELECT n, repeat('x', 100) FROM generate_series(1, 1000) AS n" >/dev/null
+catalog_blk=$(sql "SELECT split_part(trim(both '()' from ctid::text), ',', 1) FROM pg_class WHERE oid='replay_inplace'::regclass")
+test -n "$catalog_blk"
+catalog_path=$(sql "SELECT pg_relation_filepath('pg_class')")
+catalog_relid=$(sql "SELECT pg_relation_filenode('pg_class')")
+sql 'CHECKPOINT' >/dev/null
+dd if="$datadir/$catalog_path" of="$datadir/inplace-base.page" bs=8192 skip="$catalog_blk" count=1 status=none
+start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'VACUUM ANALYZE replay_inplace' >/dev/null
+stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CHECKPOINT' >/dev/null
+dd if="$datadir/$catalog_path" of="$datadir/inplace-final.page" bs=8192 skip="$catalog_blk" count=1 status=none
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/inplace-records.txt"
+grep 'rmgr: Heap ' "$datadir/inplace-records.txt" |
+    grep 'desc: INPLACE ' | grep -F "rel 1663/$dbid/$catalog_relid blk $catalog_blk" >/dev/null
+replay_case "$datadir/pg_wal" "$datadir/inplace-base.page" \
+    "$datadir/inplace-replayed.page" "1663/$dbid/$catalog_relid" "$catalog_blk" "$start" "$stop" \
+    > "$datadir/inplace-replay.log"
+grep -F 'applied Heap INPLACE ' "$datadir/inplace-replay.log" >/dev/null
+compare_pages "$datadir/inplace-replayed.page" "$datadir/inplace-final.page"
+tail -3 "$datadir/inplace-replay.log"
+
+# A KEY SHARE lock started before a concurrent non-key HOT update must also
+# lock the new tuple version, producing Heap2 LOCK_UPDATED.
+sql 'CREATE TABLE replay_lock_updated (id integer PRIMARY KEY, value text) WITH (autovacuum_enabled=false)' >/dev/null
+sql "INSERT INTO replay_lock_updated VALUES (1, 'before')" >/dev/null
+sql 'CHECKPOINT' >/dev/null
+relpath=$(sql "SELECT pg_relation_filepath('replay_lock_updated')")
+relid=$(sql "SELECT pg_relation_filenode('replay_lock_updated')")
+dd if="$datadir/$relpath" of="$datadir/lock-updated-base.page" bs=8192 count=1 status=none
+start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+"$bindir/psql" -X -qAt -h /tmp -p "$port" -d postgres \
+    -c 'SELECT id FROM replay_lock_updated WHERE id=1 AND pg_sleep(2) IS NOT NULL FOR KEY SHARE' \
+    > "$datadir/lock-updated-select.out" &
+lock_pid=$!
+sleeping=0
+for attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if [ "$(sql "SELECT count(*) FROM pg_stat_activity WHERE wait_event='PgSleep' AND query LIKE '%replay_lock_updated%' AND pid <> pg_backend_pid()")" -gt 0 ]; then
+        sleeping=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$sleeping" -ne 1 ]; then
+    wait "$lock_pid" || true
+    echo 'KEY SHARE statement did not reach pg_sleep' >&2
+    exit 1
+fi
+sql "UPDATE replay_lock_updated SET value='after' WHERE id=1" >/dev/null
+wait "$lock_pid"
+grep -x 1 "$datadir/lock-updated-select.out" >/dev/null
+stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CHECKPOINT' >/dev/null
+dd if="$datadir/$relpath" of="$datadir/lock-updated-final.page" bs=8192 count=1 status=none
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/lock-updated-records.txt"
+grep 'rmgr: Heap2' "$datadir/lock-updated-records.txt" |
+    grep 'desc: LOCK_UPDATED ' | grep -F "rel 1663/$dbid/$relid blk 0" >/dev/null
+hot_update_lsn=$(grep 'rmgr: Heap ' "$datadir/lock-updated-records.txt" |
+    grep 'desc: HOT_UPDATE ' | grep -F "rel 1663/$dbid/$relid blk 0" |
+    head -1 | sed -n 's/.*lsn: \([0-9A-F]*\/[0-9A-F]*\),.*/\1/p')
+test -n "$hot_update_lsn"
+# Ignore any hint-bit FPI emitted before the first modifying record.
+replay_case "$datadir/pg_wal" "$datadir/lock-updated-base.page" \
+    "$datadir/lock-updated-replayed.page" "1663/$dbid/$relid" 0 "$hot_update_lsn" "$stop" \
+    > "$datadir/lock-updated-replay.log"
+grep -F 'applied Heap2 LOCK_UPDATED ' "$datadir/lock-updated-replay.log" >/dev/null
+if grep -F 'applied FPI' "$datadir/lock-updated-replay.log" >/dev/null; then
+    echo 'Heap2 LOCK_UPDATED test replayed an FPI' >&2
+    exit 1
+fi
+compare_pages "$datadir/lock-updated-replayed.page" "$datadir/lock-updated-final.page"
+tail -4 "$datadir/lock-updated-replay.log"
+
+# A unique-index race can reject a speculative heap insertion after the
+# precheck, generating Heap DELETE with XLH_DELETE_IS_SUPER (flags 0x08).
+# The index function returns its argument unchanged; its delay widens only
+# the gap between the precheck and the actual index insertion.
+sql "CREATE FUNCTION replay_slow_key(i integer) RETURNS integer LANGUAGE plpgsql IMMUTABLE AS \$\$ BEGIN PERFORM pg_sleep(0.003); RETURN i; END \$\$" >/dev/null
+sql 'CREATE TABLE replay_super (id integer) WITH (autovacuum_enabled=false)' >/dev/null
+sql 'CREATE UNIQUE INDEX replay_super_idx ON replay_super (replay_slow_key(id))' >/dev/null
+sql 'INSERT INTO replay_super VALUES (-1)' >/dev/null
+sql 'CHECKPOINT' >/dev/null
+relpath=$(sql "SELECT pg_relation_filepath('replay_super')")
+relid=$(sql "SELECT pg_relation_filenode('replay_super')")
+cp "$datadir/$relpath" "$datadir/super-base.rel"
+start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+super_record=
+for round in 0 1 2; do
+    first=$((round * 100 + 1))
+    last=$((first + 79))
+    pids=
+    for worker in 1 2 3 4 5 6; do
+        "$bindir/psql" -X -qAt -h /tmp -p "$port" -d postgres \
+            -c "INSERT INTO replay_super SELECT n FROM generate_series($first, $last) AS n ON CONFLICT DO NOTHING" \
+            > "$datadir/super-worker-$worker.out" 2>&1 &
+        pids="$pids $!"
+    done
+    for pid in $pids; do
+        wait "$pid"
+    done
+    stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+    "$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/super-records.txt"
+    super_record=$(grep 'rmgr: Heap ' "$datadir/super-records.txt" |
+        grep 'desc: DELETE ' | grep -E 'flags:? 0x08' |
+        grep -F "rel 1663/$dbid/$relid" | head -1 || true)
+    if [ -n "$super_record" ]; then
+        break
+    fi
+done
+test -n "$super_record" || { echo 'concurrent ON CONFLICT did not emit speculative DELETE WAL' >&2; exit 1; }
+super_blk=$(printf '%s\n' "$super_record" |
+    sed -n 's/.*blkref #0: rel [0-9]*\/[0-9]*\/[0-9]* blk \([0-9]*\).*/\1/p')
+test -n "$super_blk"
+sql 'CHECKPOINT' >/dev/null
+if test $(( (super_blk + 1) * 8192 )) -le "$(wc -c < "$datadir/super-base.rel")"; then
+    dd if="$datadir/super-base.rel" of="$datadir/super-base.page" bs=8192 skip="$super_blk" count=1 status=none
+else
+    make_blank_page "$datadir/super-base.page"
+fi
+dd if="$datadir/$relpath" of="$datadir/super-final.page" bs=8192 skip="$super_blk" count=1 status=none
+replay_case "$datadir/pg_wal" "$datadir/super-base.page" \
+    "$datadir/super-replayed.page" "1663/$dbid/$relid" "$super_blk" "$start" "$stop" \
+    > "$datadir/super-replay.log"
+grep -F 'applied Heap DELETE ' "$datadir/super-replay.log" >/dev/null
+if grep -F 'applied FPI' "$datadir/super-replay.log" >/dev/null; then
+    echo 'speculative DELETE test replayed an FPI' >&2
+    exit 1
+fi
+compare_pages "$datadir/super-replayed.page" "$datadir/super-final.page"
+echo 'Heap DELETE with XLH_DELETE_IS_SUPER replayed incrementally'
 
 # A split record changes the old leaf, a new right leaf and sometimes more
 # pages.  Replay only the old leaf.  FPIs are disabled for this entire case.
@@ -871,6 +1381,98 @@ grep -F 'applied Hash UPDATE_META_PAGE' "$datadir/hash-meta-replay.log" >/dev/nu
 compare_index_pages "$datadir/hash-meta-replayed.page" "$datadir/hash-meta-final.page"
 tail -3 "$datadir/hash-meta-replay.log"
 
+# An index scan marks deleted hash entries LP_DEAD.  VACUUM then emits
+# DELETE with clear_dead_marking=T on the bucket page.
+sql 'CREATE TABLE replay_hash_dead_flag (id integer, value integer) WITH (autovacuum_enabled=false)' >/dev/null
+sql 'CREATE INDEX replay_hash_dead_flag_idx ON replay_hash_dead_flag USING hash (value)' >/dev/null
+sql 'INSERT INTO replay_hash_dead_flag SELECT n, 1 FROM generate_series(1, 200) AS n' >/dev/null
+sql 'DELETE FROM replay_hash_dead_flag WHERE id <= 30' >/dev/null
+scan_plan=$(sql 'SET enable_seqscan=off; SET enable_bitmapscan=off; EXPLAIN ANALYZE SELECT id FROM replay_hash_dead_flag WHERE value=1')
+printf '%s\n' "$scan_plan" | grep -F 'Index Scan using replay_hash_dead_flag_idx' >/dev/null
+sql 'CHECKPOINT' >/dev/null
+relpath=$(sql "SELECT pg_relation_filepath('replay_hash_dead_flag_idx')")
+relid=$(sql "SELECT pg_relation_filenode('replay_hash_dead_flag_idx')")
+cp "$datadir/$relpath" "$datadir/hash-dead-flag-base.rel"
+start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'VACUUM (INDEX_CLEANUP ON) replay_hash_dead_flag' >/dev/null
+stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CHECKPOINT' >/dev/null
+cp "$datadir/$relpath" "$datadir/hash-dead-flag-final.rel"
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/hash-dead-flag-records.txt"
+dead_flag_record=$(grep 'rmgr: Hash' "$datadir/hash-dead-flag-records.txt" |
+    grep 'desc: DELETE clear_dead_marking T' |
+    grep -F "rel 1663/$dbid/$relid" | head -1)
+test -n "$dead_flag_record" || { echo 'Hash DELETE did not clear HAS_DEAD_TUPLES' >&2; exit 1; }
+dead_flag_blk=$(printf '%s\n' "$dead_flag_record" |
+    sed -n 's/.*blkref #1: rel [0-9]*\/[0-9]*\/[0-9]* blk \([0-9]*\).*/\1/p')
+test -n "$dead_flag_blk"
+dd if="$datadir/hash-dead-flag-base.rel" of="$datadir/hash-dead-flag-base.page" bs=8192 skip="$dead_flag_blk" count=1 status=none
+dd if="$datadir/hash-dead-flag-final.rel" of="$datadir/hash-dead-flag-final.page" bs=8192 skip="$dead_flag_blk" count=1 status=none
+replay_case "$datadir/pg_wal" "$datadir/hash-dead-flag-base.page" \
+    "$datadir/hash-dead-flag-replayed.page" "1663/$dbid/$relid" "$dead_flag_blk" "$start" "$stop" \
+    > "$datadir/hash-dead-flag-replay.log"
+grep -F 'applied Hash DELETE ' "$datadir/hash-dead-flag-replay.log" |
+    grep -F 'block_ref=1' >/dev/null
+if grep -F 'applied FPI' "$datadir/hash-dead-flag-replay.log" >/dev/null; then
+    echo 'Hash DELETE dead-flag test replayed an FPI' >&2
+    exit 1
+fi
+compare_index_pages "$datadir/hash-dead-flag-replayed.page" "$datadir/hash-dead-flag-final.page"
+python3 - "$datadir/hash-dead-flag-base.page" "$datadir/hash-dead-flag-replayed.page" "$datadir/hash-dead-flag-final.page" <<'PY'
+import struct
+import sys
+
+HAS_DEAD_TUPLES = 0x80
+flags = []
+for path in sys.argv[1:]:
+    page = open(path, 'rb').read()
+    special = struct.unpack_from('<H', page, 16)[0]
+    flags.append(struct.unpack_from('<H', page, special + 12)[0])
+assert flags[0] & HAS_DEAD_TUPLES, flags
+assert not flags[1] & HAS_DEAD_TUPLES and not flags[2] & HAS_DEAD_TUPLES, flags
+print('Hash DELETE clears HAS_DEAD_TUPLES')
+PY
+tail -2 "$datadir/hash-dead-flag-replay.log"
+
+# A hash index scan marks deleted entries LP_DEAD.  Inserting into its full
+# bucket then vacuums one page and updates the metapage in the same WAL record.
+sql 'CREATE TABLE replay_hash_one_page (id integer, value integer) WITH (autovacuum_enabled=false)' >/dev/null
+sql 'CREATE INDEX replay_hash_one_page_idx ON replay_hash_one_page USING hash (value)' >/dev/null
+sql 'INSERT INTO replay_hash_one_page SELECT n, 1 FROM generate_series(1, 1200) AS n' >/dev/null
+sql 'DELETE FROM replay_hash_one_page WHERE id <= 300' >/dev/null
+scan_plan=$(sql 'SET enable_seqscan=off; SET enable_bitmapscan=off; EXPLAIN ANALYZE SELECT id FROM replay_hash_one_page WHERE value=1')
+printf '%s\n' "$scan_plan" | grep -F 'Index Scan using replay_hash_one_page_idx' >/dev/null
+sql 'CHECKPOINT' >/dev/null
+relpath=$(sql "SELECT pg_relation_filepath('replay_hash_one_page_idx')")
+relid=$(sql "SELECT pg_relation_filenode('replay_hash_one_page_idx')")
+cp "$datadir/$relpath" "$datadir/hash-one-page-base.rel"
+start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'INSERT INTO replay_hash_one_page VALUES (1201, 1)' >/dev/null
+stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CHECKPOINT' >/dev/null
+cp "$datadir/$relpath" "$datadir/hash-one-page-final.rel"
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/hash-one-page-records.txt"
+one_page_record=$(grep 'rmgr: Hash' "$datadir/hash-one-page-records.txt" |
+    grep 'desc: VACUUM_ONE_PAGE ' | grep -F "rel 1663/$dbid/$relid" | head -1)
+test -n "$one_page_record" || { echo 'Hash VACUUM_ONE_PAGE WAL was not generated' >&2; exit 1; }
+one_page_blk=$(printf '%s\n' "$one_page_record" |
+    sed -n 's/.*blkref #0: rel [0-9]*\/[0-9]*\/[0-9]* blk \([0-9]*\).*/\1/p')
+test -n "$one_page_blk"
+for blk in "$one_page_blk" 0; do
+    dd if="$datadir/hash-one-page-base.rel" of="$datadir/hash-one-page-base-$blk.page" bs=8192 skip="$blk" count=1 status=none
+    dd if="$datadir/hash-one-page-final.rel" of="$datadir/hash-one-page-final-$blk.page" bs=8192 skip="$blk" count=1 status=none
+    replay_case "$datadir/pg_wal" "$datadir/hash-one-page-base-$blk.page" \
+        "$datadir/hash-one-page-replayed-$blk.page" "1663/$dbid/$relid" "$blk" "$start" "$stop" \
+        > "$datadir/hash-one-page-replay-$blk.log"
+    grep -F 'applied Hash VACUUM_ONE_PAGE ' "$datadir/hash-one-page-replay-$blk.log" >/dev/null
+    if grep -F 'applied FPI' "$datadir/hash-one-page-replay-$blk.log" >/dev/null; then
+        echo 'Hash VACUUM_ONE_PAGE test replayed an FPI' >&2
+        exit 1
+    fi
+    compare_index_pages "$datadir/hash-one-page-replayed-$blk.page" "$datadir/hash-one-page-final-$blk.page"
+    tail -3 "$datadir/hash-one-page-replay-$blk.log"
+done
+
 sql 'CREATE TABLE replay_hash_init (id integer) WITH (autovacuum_enabled=false)' >/dev/null
 sql 'INSERT INTO replay_hash_init VALUES (1), (2)' >/dev/null
 start=$(sql 'SELECT pg_current_wal_insert_lsn()')
@@ -965,6 +1567,136 @@ for ref in 1 2 5; do
     compare_index_pages "$datadir/hash-squeeze-replayed-$ref.page" "$datadir/hash-squeeze-final-$ref.page"
     tail -2 "$datadir/hash-squeeze-replay-$ref.log"
 done
+
+# Reuse an overflow page freed by SQUEEZE_PAGE.  Its ADD_OVFL_PAGE record
+# modifies bitmap block #2 by setting the page's allocation bit.
+sql 'CHECKPOINT' >/dev/null
+cp "$datadir/$relpath" "$datadir/hash-bitmap-reuse-base.rel"
+start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'INSERT INTO replay_hash_overflow SELECT 1 FROM generate_series(1, 1000)' >/dev/null
+stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CHECKPOINT' >/dev/null
+cp "$datadir/$relpath" "$datadir/hash-bitmap-reuse-final.rel"
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/hash-bitmap-reuse-records.txt"
+bitmap_record=$(grep 'rmgr: Hash' "$datadir/hash-bitmap-reuse-records.txt" |
+    grep 'desc: ADD_OVFL_PAGE ' | grep 'bmpage_found T' |
+    grep -F "rel 1663/$dbid/$relid" | grep 'blkref #2:' | head -1)
+test -n "$bitmap_record" || { echo 'Hash bitmap reuse did not generate ADD_OVFL_PAGE block #2' >&2; exit 1; }
+bitmap_blk=$(printf '%s\n' "$bitmap_record" |
+    sed -n 's/.*blkref #2: rel [0-9]*\/[0-9]*\/[0-9]* blk \([0-9]*\).*/\1/p')
+test -n "$bitmap_blk"
+dd if="$datadir/hash-bitmap-reuse-base.rel" of="$datadir/hash-bitmap-reuse-base.page" bs=8192 skip="$bitmap_blk" count=1 status=none
+dd if="$datadir/hash-bitmap-reuse-final.rel" of="$datadir/hash-bitmap-reuse-final.page" bs=8192 skip="$bitmap_blk" count=1 status=none
+replay_case "$datadir/pg_wal" "$datadir/hash-bitmap-reuse-base.page" \
+    "$datadir/hash-bitmap-reuse-replayed.page" "1663/$dbid/$relid" "$bitmap_blk" "$start" "$stop" \
+    > "$datadir/hash-bitmap-reuse-replay.log"
+grep -F 'applied Hash ADD_OVFL_PAGE ' "$datadir/hash-bitmap-reuse-replay.log" |
+    grep -F 'block_ref=2' >/dev/null
+if grep -F 'applied FPI' "$datadir/hash-bitmap-reuse-replay.log" >/dev/null; then
+    echo 'Hash bitmap reuse test replayed an FPI' >&2
+    exit 1
+fi
+compare_index_pages "$datadir/hash-bitmap-reuse-replayed.page" "$datadir/hash-bitmap-reuse-final.page"
+tail -3 "$datadir/hash-bitmap-reuse-replay.log"
+
+# Exhausting a normal 4096-byte hash bitmap needs more than 32,000 overflow
+# pages.  In a separate disposable cluster, narrow only the bitmap-size
+# metadata to four bytes while the server is stopped.  PostgreSQL still
+# generates the real ADD_OVFL_PAGE WAL that initializes a second bitmap page.
+if test -f "$rollover_datadir/postmaster.pid"; then
+    "$bindir/pg_ctl" -D "$rollover_datadir" stop -m immediate >/dev/null 2>&1 || true
+fi
+rm -rf "$rollover_datadir"
+# Exercise the checksum transition on every version.  Checksums must be off
+# before we deliberately edit the stopped cluster's hash metapage.
+"$bindir/initdb" -D "$rollover_datadir" -A trust --no-sync --data-checksums >/dev/null
+rollover_port=$((port + 100))
+"$bindir/pg_ctl" -D "$rollover_datadir" \
+    -o "-k /tmp -p $rollover_port -c fsync=off -c full_page_writes=off -c autovacuum=off" \
+    -l "$rollover_datadir/server.log" start >/dev/null
+rollover_started=1
+rollover_sql() { "$bindir/psql" -X -qAt -h /tmp -p "$rollover_port" -d postgres -c "$1"; }
+rollover_sql 'CREATE TABLE replay_bitmap_rollover (id integer, value integer) WITH (autovacuum_enabled=false)' >/dev/null
+rollover_sql 'CREATE INDEX replay_bitmap_rollover_idx ON replay_bitmap_rollover USING hash(value)' >/dev/null
+rollover_sql 'CHECKPOINT' >/dev/null
+rollover_path=$(rollover_sql "SELECT pg_relation_filepath('replay_bitmap_rollover_idx')")
+rollover_relid=$(rollover_sql "SELECT pg_relation_filenode('replay_bitmap_rollover_idx')")
+rollover_dbid=$(rollover_sql 'SELECT oid FROM pg_database WHERE datname = current_database()')
+test "$(rollover_sql 'SHOW data_checksums')" = on
+"$bindir/pg_ctl" -D "$rollover_datadir" stop -m fast >/dev/null
+rollover_started=0
+"$bindir/pg_checksums" --disable -D "$rollover_datadir" >/dev/null
+python3 - "$rollover_datadir/$rollover_path" <<'PY'
+import struct
+import sys
+
+with open(sys.argv[1], 'r+b') as relation:
+    page = bytearray(relation.read(8192))
+    assert len(page) == 8192
+    # PageGetContents begins at byte 24; hashm_bmsize/hashm_bmshift are
+    # uint16 fields at offsets 20/22 in HashMetaPageData (PG 14-18).
+    assert struct.unpack_from('<HH', page, 44) == (4096, 15)
+    struct.pack_into('<HH', page, 44, 4, 5)
+    relation.seek(0)
+    relation.write(page)
+PY
+dd if="$rollover_datadir/$rollover_path" \
+    of="$datadir/hash-bitmap-rollover-meta-base.page" bs=8192 count=1 status=none
+"$bindir/pg_ctl" -D "$rollover_datadir" \
+    -o "-k /tmp -p $rollover_port -c fsync=off -c full_page_writes=off -c autovacuum=off" \
+    -l "$rollover_datadir/server.log" start >/dev/null
+rollover_started=1
+test "$(rollover_sql 'SHOW data_checksums')" = off
+rollover_start=$(rollover_sql 'SELECT pg_current_wal_insert_lsn()')
+rollover_sql 'INSERT INTO replay_bitmap_rollover SELECT n, 1 FROM generate_series(1, 20000) AS n' >/dev/null
+rollover_stop=$(rollover_sql 'SELECT pg_current_wal_insert_lsn()')
+rollover_sql 'CHECKPOINT' >/dev/null
+"$bindir/pg_waldump" -p "$rollover_datadir/pg_wal" -s "$rollover_start" -e "$rollover_stop" \
+    > "$datadir/hash-bitmap-rollover-records.txt"
+rollover_record=$(grep 'rmgr: Hash' "$datadir/hash-bitmap-rollover-records.txt" |
+    grep 'desc: ADD_OVFL_PAGE ' | grep 'bmpage_found F' |
+    grep -F "rel 1663/$rollover_dbid/$rollover_relid" | grep 'blkref #3:' |
+    grep -F "blkref #4: rel 1663/$rollover_dbid/$rollover_relid blk 0" | head -1)
+test -n "$rollover_record" || { echo 'Hash rollover did not update bitmap block #3 and metapage #4' >&2; exit 1; }
+rollover_lsn=$(printf '%s\n' "$rollover_record" |
+    sed -n 's/.*lsn: \([0-9A-F]*\/[0-9A-F]*\),.*/\1/p')
+rollover_blk=$(printf '%s\n' "$rollover_record" |
+    sed -n 's/.*blkref #3: rel [0-9]*\/[0-9]*\/[0-9]* blk \([0-9]*\).*/\1/p')
+test -n "$rollover_lsn" && test -n "$rollover_blk"
+make_blank_page "$datadir/hash-bitmap-rollover-base.page"
+dd if="$rollover_datadir/$rollover_path" of="$datadir/hash-bitmap-rollover-final.page" \
+    bs=8192 skip="$rollover_blk" count=1 status=none
+dd if="$rollover_datadir/$rollover_path" \
+    of="$datadir/hash-bitmap-rollover-meta-final.page" bs=8192 count=1 status=none
+replay_case "$rollover_datadir/pg_wal" "$datadir/hash-bitmap-rollover-base.page" \
+    "$datadir/hash-bitmap-rollover-replayed.page" \
+    "1663/$rollover_dbid/$rollover_relid" "$rollover_blk" "$rollover_start" "$rollover_stop" \
+    > "$datadir/hash-bitmap-rollover-replay.log"
+grep -F 'applied Hash ADD_OVFL_PAGE ' "$datadir/hash-bitmap-rollover-replay.log" |
+    grep -F 'block_ref=3' >/dev/null
+if grep -F 'applied FPI' "$datadir/hash-bitmap-rollover-replay.log" >/dev/null; then
+    echo 'Hash bitmap rollover test replayed an FPI' >&2
+    exit 1
+fi
+compare_index_pages "$datadir/hash-bitmap-rollover-replayed.page" "$datadir/hash-bitmap-rollover-final.page"
+replay_case "$rollover_datadir/pg_wal" "$datadir/hash-bitmap-rollover-meta-base.page" \
+    "$datadir/hash-bitmap-rollover-meta-replayed.page" \
+    "1663/$rollover_dbid/$rollover_relid" 0 "$rollover_start" "$rollover_stop" \
+    > "$datadir/hash-bitmap-rollover-meta-replay.log"
+grep -F "applied Hash ADD_OVFL_PAGE lsn=$rollover_lsn " \
+    "$datadir/hash-bitmap-rollover-meta-replay.log" |
+    grep -F 'block_ref=4' >/dev/null
+if grep -F 'applied FPI' "$datadir/hash-bitmap-rollover-meta-replay.log" >/dev/null; then
+    echo 'Hash bitmap rollover metapage replayed an FPI' >&2
+    exit 1
+fi
+compare_index_pages "$datadir/hash-bitmap-rollover-meta-replayed.page" \
+    "$datadir/hash-bitmap-rollover-meta-final.page"
+"$bindir/pg_ctl" -D "$rollover_datadir" stop -m fast >/dev/null
+rollover_started=0
+rm -rf "$rollover_datadir"
+tail -2 "$datadir/hash-bitmap-rollover-replay.log"
+tail -2 "$datadir/hash-bitmap-rollover-meta-replay.log"
 
 # A partly emptied overflow chain must move tuples between existing hash
 # pages before it can squeeze away the tail.  Check the destination page's
@@ -1199,9 +1931,101 @@ for ref in 0 1; do
         echo 'GiST page deletion replayed an FPI' >&2
         exit 1
     fi
-    compare_index_pages "$datadir/gist-delete-replayed-$ref.page" "$datadir/gist-delete-final-$ref.page" gist
+    compare_index_pages "$datadir/gist-delete-replayed-$ref.page" "$datadir/gist-delete-final-$ref.page"
+    if [ "$ref" -eq 0 ]; then
+        grep -F 'applied GiST PAGE_UPDATE' "$datadir/gist-delete-replay-$ref.log" >/dev/null
+        python3 - "$datadir/gist-delete-base-$ref.page" \
+            "$datadir/gist-delete-replayed-$ref.page" \
+            "$datadir/gist-delete-final-$ref.page" <<'PY'
+import struct
+import sys
+
+def flags(path):
+    page = open(path, 'rb').read()
+    special = struct.unpack_from('<H', page, 16)[0]
+    return struct.unpack_from('<H', page, special + 12)[0]
+
+base, replayed, final = [flags(path) for path in sys.argv[1:]]
+assert base & 0x04 == 0 and replayed & 0x04 and final & 0x04, \
+    (base, replayed, final)
+print('GiST leaf PAGE_UPDATE sets F_TUPLES_DELETED')
+PY
+    fi
     tail -3 "$datadir/gist-delete-replay-$ref.log"
 done
+
+# GiST DELETE is emitted when an index scan marks dead leaf items and a later
+# insertion needs space on that leaf.  Check that redo clears HAS_GARBAGE and
+# sets F_TUPLES_DELETED, without using a full-page image.
+sql 'CREATE TABLE replay_gist_kill (id integer, area box) WITH (autovacuum_enabled=false)' >/dev/null
+sql 'INSERT INTO replay_gist_kill SELECT n, box(point(n, 0), point(n + 1, 1)) FROM generate_series(1, 2000) AS n' >/dev/null
+sql 'CREATE INDEX replay_gist_kill_idx ON replay_gist_kill USING gist (area)' >/dev/null
+sql 'CHECKPOINT' >/dev/null
+sql 'DELETE FROM replay_gist_kill WHERE id <= 300' >/dev/null
+scan_plan=$(sql "SET enable_seqscan=off; SET enable_bitmapscan=off; SET enable_indexonlyscan=off; EXPLAIN (ANALYZE, COSTS OFF) SELECT id FROM replay_gist_kill WHERE area && box(point(0,0), point(5000,2))")
+printf '%s\n' "$scan_plan" | grep -F 'Index Scan using replay_gist_kill_idx' >/dev/null
+sql 'CHECKPOINT' >/dev/null
+relpath=$(sql "SELECT pg_relation_filepath('replay_gist_kill_idx')")
+relid=$(sql "SELECT pg_relation_filenode('replay_gist_kill_idx')")
+cp "$datadir/$relpath" "$datadir/gist-kill-base.rel"
+start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'INSERT INTO replay_gist_kill SELECT n, box(point(n % 300, 0), point((n % 300) + 1, 1)) FROM generate_series(2001, 2500) AS n' >/dev/null
+stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CHECKPOINT' >/dev/null
+cp "$datadir/$relpath" "$datadir/gist-kill-final.rel"
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/gist-kill-records.txt"
+kill_record=$(grep 'rmgr: Gist' "$datadir/gist-kill-records.txt" |
+    grep 'desc: DELETE ' | grep -F "rel 1663/$dbid/$relid" | head -1)
+test -n "$kill_record" || { echo 'GiST DELETE test did not generate DELETE WAL' >&2; exit 1; }
+kill_blk=$(printf '%s\n' "$kill_record" |
+    sed -n 's/.*blkref #0: rel [0-9]*\/[0-9]*\/[0-9]* blk \([0-9]*\).*/\1/p')
+test -n "$kill_blk"
+dd if="$datadir/gist-kill-base.rel" of="$datadir/gist-kill-base.page" bs=8192 skip="$kill_blk" count=1 status=none
+dd if="$datadir/gist-kill-final.rel" of="$datadir/gist-kill-final.page" bs=8192 skip="$kill_blk" count=1 status=none
+replay_case "$datadir/pg_wal" "$datadir/gist-kill-base.page" \
+    "$datadir/gist-kill-replayed.page" "1663/$dbid/$relid" "$kill_blk" "$start" "$stop" \
+    > "$datadir/gist-kill-replay.log"
+grep -F 'applied GiST DELETE' "$datadir/gist-kill-replay.log" >/dev/null
+if grep -F 'applied FPI' "$datadir/gist-kill-replay.log" >/dev/null; then
+    echo 'GiST DELETE test replayed an FPI' >&2
+    exit 1
+fi
+# PostgreSQL's primary gistprunepage() clears HAS_GARBAGE but does not set
+# F_TUPLES_DELETED; gistRedoDeleteRecord() does set it.  Assert that this is
+# the only page difference rather than hiding the bit in compare_index_pages.
+python3 - "$datadir/gist-kill-base.page" "$datadir/gist-kill-replayed.page" \
+    "$datadir/gist-kill-final.page" <<'PY'
+import struct
+import sys
+
+TUPLES_DELETED = 0x04
+HAS_GARBAGE = 0x10
+
+def normalized(path):
+    page = bytearray(open(path, 'rb').read())
+    assert len(page) == 8192
+    lower, upper = struct.unpack_from('<HH', page, 12)
+    assert 24 <= lower <= upper <= 8192
+    page[8:10] = b'\0\0'  # checksum
+    page[lower:upper] = bytes(upper - lower)
+    return page
+
+def flags(page):
+    special = struct.unpack_from('<H', page, 16)[0]
+    return struct.unpack_from('<H', page, special + 12)[0]
+
+base, replayed, final = [normalized(path) for path in sys.argv[1:]]
+base_flags, replayed_flags, final_flags = map(flags, (base, replayed, final))
+assert base_flags & HAS_GARBAGE and not base_flags & TUPLES_DELETED
+assert replayed_flags == final_flags | TUPLES_DELETED, \
+    (base_flags, replayed_flags, final_flags)
+special = struct.unpack_from('<H', replayed, 16)[0]
+replayed[special + 12] &= ~TUPLES_DELETED
+assert replayed == final, \
+    [i for i, (a, b) in enumerate(zip(replayed, final)) if a != b][:16]
+print('GiST DELETE redo sets F_TUPLES_DELETED; all other page bytes match')
+PY
+tail -3 "$datadir/gist-kill-replay.log"
 
 sql 'CREATE TABLE replay_gin (id integer, words tsvector) WITH (autovacuum_enabled=false)' >/dev/null
 sql 'CREATE INDEX replay_gin_idx ON replay_gin USING gin (words) WITH (fastupdate=off)' >/dev/null
@@ -1464,6 +2288,47 @@ for ref in 0 1 2; do
 done
 echo 'GIN DELETE_PAGE references match'
 
+# Long distinct GIN entry keys make the inner tree split.  Its split record
+# clears INCOMPLETE_SPLIT on child block reference #3 without an FPI there.
+sql 'CREATE TABLE replay_gin_inner_split (id integer, tags text[]) WITH (autovacuum_enabled=false)' >/dev/null
+sql 'CREATE INDEX replay_gin_inner_split_idx ON replay_gin_inner_split USING gin(tags) WITH (fastupdate=off)' >/dev/null
+sql 'CHECKPOINT' >/dev/null
+relpath=$(sql "SELECT pg_relation_filepath('replay_gin_inner_split_idx')")
+relid=$(sql "SELECT pg_relation_filenode('replay_gin_inner_split_idx')")
+cp "$datadir/$relpath" "$datadir/gin-inner-split-base.rel"
+start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql "INSERT INTO replay_gin_inner_split SELECT n, ARRAY[repeat('a', 180) || lpad(n::text, 8, '0')] FROM generate_series(1, 2000) AS n" >/dev/null
+stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CHECKPOINT' >/dev/null
+cp "$datadir/$relpath" "$datadir/gin-inner-split-final.rel"
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/gin-inner-split-records.txt"
+gin_inner_record=$(grep 'rmgr: Gin ' "$datadir/gin-inner-split-records.txt" |
+    grep 'desc: SPLIT ' | grep 'isleaf: F' | grep 'blkref #3:' |
+    grep -F "rel 1663/$dbid/$relid" | head -1)
+test -n "$gin_inner_record" || { echo 'GIN inner SPLIT did not include child block #3' >&2; exit 1; }
+gin_child_blk=$(printf '%s\n' "$gin_inner_record" |
+    sed -n 's/.*blkref #3: rel [0-9]*\/[0-9]*\/[0-9]* blk \([0-9]*\).*/\1/p')
+gin_inner_lsn=$(printf '%s\n' "$gin_inner_record" |
+    sed -n 's/.*lsn: \([0-9A-F]*\/[0-9A-F]*\),.*/\1/p')
+test -n "$gin_child_blk" && test -n "$gin_inner_lsn"
+if test $(( (gin_child_blk + 1) * 8192 )) -le "$(wc -c < "$datadir/gin-inner-split-base.rel")"; then
+    dd if="$datadir/gin-inner-split-base.rel" of="$datadir/gin-inner-split-base.page" bs=8192 skip="$gin_child_blk" count=1 status=none
+else
+    make_blank_page "$datadir/gin-inner-split-base.page"
+fi
+dd if="$datadir/gin-inner-split-final.rel" of="$datadir/gin-inner-split-final.page" bs=8192 skip="$gin_child_blk" count=1 status=none
+replay_case "$datadir/pg_wal" "$datadir/gin-inner-split-base.page" \
+    "$datadir/gin-inner-split-replayed.page" "1663/$dbid/$relid" "$gin_child_blk" "$start" "$stop" \
+    > "$datadir/gin-inner-split-replay.log"
+grep -F "applied GIN CLEAR_INCOMPLETE_SPLIT lsn=$gin_inner_lsn" "$datadir/gin-inner-split-replay.log" |
+    grep -F 'block_ref=3' >/dev/null
+if grep -F "applied FPI lsn=$gin_inner_lsn" "$datadir/gin-inner-split-replay.log" >/dev/null; then
+    echo 'GIN inner SPLIT child block #3 used an FPI' >&2
+    exit 1
+fi
+compare_index_pages "$datadir/gin-inner-split-replayed.page" "$datadir/gin-inner-split-final.page"
+echo 'GIN inner SPLIT clears child INCOMPLETE_SPLIT incrementally'
+
 sql 'CREATE TABLE replay_spgist (id integer, pos point) WITH (autovacuum_enabled=false)' >/dev/null
 sql 'CREATE INDEX replay_spgist_idx ON replay_spgist USING spgist (pos)' >/dev/null
 sql 'INSERT INTO replay_spgist VALUES (1, point(1,1))' >/dev/null
@@ -1653,6 +2518,91 @@ if grep -F 'applied FPI' "$datadir/spgist-text-all-replay.log" >/dev/null; then
     exit 1
 fi
 echo 'SP-GiST text prefix split increments match'
+
+# VACUUM turns an entirely deleted non-root leaf chain into a DEAD head.
+# Inserting into that chain replaces the dead tuple at the same offset.
+sql 'CREATE TABLE replay_spgist_replace (id integer, pos point) WITH (autovacuum_enabled=false)' >/dev/null
+sql 'CREATE INDEX replay_spgist_replace_idx ON replay_spgist_replace USING spgist(pos)' >/dev/null
+sql 'INSERT INTO replay_spgist_replace SELECT n, point(n % 100, n / 100) FROM generate_series(1, 3000) AS n' >/dev/null
+sql 'DELETE FROM replay_spgist_replace' >/dev/null
+sql 'VACUUM (INDEX_CLEANUP ON) replay_spgist_replace' >/dev/null
+sql 'CHECKPOINT' >/dev/null
+relpath=$(sql "SELECT pg_relation_filepath('replay_spgist_replace_idx')")
+relid=$(sql "SELECT pg_relation_filenode('replay_spgist_replace_idx')")
+cp "$datadir/$relpath" "$datadir/spgist-replace-base.rel"
+start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'INSERT INTO replay_spgist_replace VALUES (3001, point(2,0))' >/dev/null
+stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CHECKPOINT' >/dev/null
+cp "$datadir/$relpath" "$datadir/spgist-replace-final.rel"
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/spgist-replace-records.txt"
+replace_record=$(python3 - "$datadir/spgist-replace-records.txt" "$dbid" "$relid" <<'PY'
+import re
+import sys
+
+target = 'rel 1663/{}/{}'.format(sys.argv[2], sys.argv[3])
+for line in open(sys.argv[1]):
+    if ('rmgr: SPGist' in line and target in line and
+            re.search(r'desc: ADD_LEAF off: (\d+), headoff: \1,', line)):
+        print(line.strip())
+        break
+PY
+)
+test -n "$replace_record" || { echo 'SP-GiST did not replace a DEAD leaf tuple' >&2; exit 1; }
+replace_blk=$(printf '%s\n' "$replace_record" |
+    sed -n 's/.*blkref #0: rel [0-9]*\/[0-9]*\/[0-9]* blk \([0-9]*\).*/\1/p')
+test -n "$replace_blk"
+dd if="$datadir/spgist-replace-base.rel" of="$datadir/spgist-replace-base.page" bs=8192 skip="$replace_blk" count=1 status=none
+dd if="$datadir/spgist-replace-final.rel" of="$datadir/spgist-replace-final.page" bs=8192 skip="$replace_blk" count=1 status=none
+replay_case "$datadir/pg_wal" "$datadir/spgist-replace-base.page" \
+    "$datadir/spgist-replace-replayed.page" "1663/$dbid/$relid" "$replace_blk" "$start" "$stop" \
+    > "$datadir/spgist-replace-replay.log"
+grep -F 'applied SP-GiST ADD_LEAF ' "$datadir/spgist-replace-replay.log" >/dev/null
+if grep -F 'applied FPI' "$datadir/spgist-replace-replay.log" >/dev/null; then
+    echo 'SP-GiST dead-leaf replacement used an FPI' >&2
+    exit 1
+fi
+compare_index_pages "$datadir/spgist-replace-replayed.page" "$datadir/spgist-replace-final.page"
+echo 'SP-GiST ADD_LEAF replaces a DEAD tuple at the same offset'
+
+# NULL keys use a separate SP-GiST tree.  Its first split marks the inner
+# page with SPGIST_NULLS, which must survive incremental replay.
+sql 'CREATE TABLE replay_spgist_null (id integer, pos point) WITH (autovacuum_enabled=false)' >/dev/null
+sql 'CREATE INDEX replay_spgist_null_idx ON replay_spgist_null USING spgist(pos)' >/dev/null
+sql 'CHECKPOINT' >/dev/null
+relpath=$(sql "SELECT pg_relation_filepath('replay_spgist_null_idx')")
+relid=$(sql "SELECT pg_relation_filenode('replay_spgist_null_idx')")
+cp "$datadir/$relpath" "$datadir/spgist-null-base.rel"
+start=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'INSERT INTO replay_spgist_null SELECT n, NULL::point FROM generate_series(1, 5000) AS n' >/dev/null
+stop=$(sql 'SELECT pg_current_wal_insert_lsn()')
+sql 'CHECKPOINT' >/dev/null
+cp "$datadir/$relpath" "$datadir/spgist-null-final.rel"
+"$bindir/pg_waldump" -p "$datadir/pg_wal" -s "$start" -e "$stop" > "$datadir/spgist-null-records.txt"
+null_split_record=$(grep 'rmgr: SPGist' "$datadir/spgist-null-records.txt" |
+    grep 'desc: PICKSPLIT ' | grep '(nulls)' | grep 'blkref #2:' |
+    grep -F "rel 1663/$dbid/$relid" | head -1)
+test -n "$null_split_record" || { echo 'SP-GiST NULL PICKSPLIT WAL was not generated' >&2; exit 1; }
+null_inner_blk=$(printf '%s\n' "$null_split_record" |
+    sed -n 's/.*blkref #2: rel [0-9]*\/[0-9]*\/[0-9]* blk \([0-9]*\).*/\1/p')
+test -n "$null_inner_blk"
+if test $(( (null_inner_blk + 1) * 8192 )) -le "$(wc -c < "$datadir/spgist-null-base.rel")"; then
+    dd if="$datadir/spgist-null-base.rel" of="$datadir/spgist-null-base.page" bs=8192 skip="$null_inner_blk" count=1 status=none
+else
+    make_blank_page "$datadir/spgist-null-base.page"
+fi
+dd if="$datadir/spgist-null-final.rel" of="$datadir/spgist-null-final.page" bs=8192 skip="$null_inner_blk" count=1 status=none
+replay_case "$datadir/pg_wal" "$datadir/spgist-null-base.page" \
+    "$datadir/spgist-null-replayed.page" "1663/$dbid/$relid" "$null_inner_blk" "$start" "$stop" \
+    > "$datadir/spgist-null-replay.log"
+grep -F 'applied SP-GiST PICKSPLIT ' "$datadir/spgist-null-replay.log" |
+    grep -F 'block_ref=2' >/dev/null
+if grep -F 'applied FPI' "$datadir/spgist-null-replay.log" >/dev/null; then
+    echo 'SP-GiST NULL PICKSPLIT used an FPI' >&2
+    exit 1
+fi
+compare_index_pages "$datadir/spgist-null-replayed.page" "$datadir/spgist-null-final.page"
+echo 'SP-GiST NULL PICKSPLIT inner page matches'
 
 sql 'CREATE TABLE replay_brin (id integer) WITH (autovacuum_enabled=false)' >/dev/null
 sql 'INSERT INTO replay_brin SELECT generate_series(1, 300)' >/dev/null
@@ -1883,3 +2833,4 @@ dd if="$datadir/$relpath" of="$datadir/sequence-final.page" bs=8192 count=1 stat
 compare_index_pages "$datadir/sequence-replayed.page" "$datadir/sequence-final.page"
 cat "$datadir/sequence-replay.log"
 report_start_warnings
+echo "integration checks passed for PostgreSQL $version"

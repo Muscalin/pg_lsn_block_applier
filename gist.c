@@ -9,6 +9,7 @@ apply_gist_page_update(XLogReaderState *record, Page page, int block_id)
 	Size pos = 0;
 	uint16 i;
 	Size offsets_len;
+	OfflineGistPageOpaqueData *opaque;
 
 	if (block_id != 0 || XLogRecGetDataLen(record) < sizeof(header))
 		die("invalid GiST PAGE_UPDATE target block or header");
@@ -36,7 +37,12 @@ apply_gist_page_update(XLogReaderState *record, Page page, int block_id)
 		return;
 	}
 	if (header.ntodelete != 0)
+	{
 		delete_index_items(page, data, header.ntodelete);
+		opaque = (OfflineGistPageOpaqueData *) PageGetSpecialPointer(page);
+		if (opaque->flags & OFFLINE_GIST_LEAF)
+			opaque->flags |= OFFLINE_GIST_TUPLES_DELETED;
+	}
 	pos = offsets_len;
 	for (i = 0; i < header.ntoinsert; i++)
 	{
@@ -86,6 +92,7 @@ apply_gist_delete(XLogReaderState *record, Page page, int block_id)
 	delete_index_items(page, offsets, ndelete);
 	opaque = (OfflineGistPageOpaqueData *) PageGetSpecialPointer(page);
 	opaque->flags &= ~OFFLINE_GIST_HAS_GARBAGE;
+	opaque->flags |= OFFLINE_GIST_TUPLES_DELETED;
 	PageSetLSN(page, record->EndRecPtr);
 }
 

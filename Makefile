@@ -61,7 +61,7 @@ layout-check: layout_check.c pg_lsn_block_applier_internal.h
 pg_lsn_block_applier: check-pg-source layout-check $(SOURCES) pg_lsn_block_applier_internal.h $(wildcard $(XLOGREADER))
 	@set -eu; \
 		tmp_dir=$$(mktemp -d); \
-		trap 'rm -f "$$tmp_dir/xlogreader.o"; rmdir "$$tmp_dir"' EXIT; \
+		trap 'rm -rf "$$tmp_dir"' EXIT; \
 		$(CC) $(CPPFLAGS) $(PG_CPPFLAGS) $(CFLAGS) -Wno-sign-compare -std=gnu11 \
 			-c "$(XLOGREADER)" -o "$$tmp_dir/xlogreader.o"; \
 		$(CC) $(CPPFLAGS) $(PG_CPPFLAGS) $(CFLAGS) -std=gnu11 $(SOURCES) \

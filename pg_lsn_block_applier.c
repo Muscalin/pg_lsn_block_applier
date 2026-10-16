@@ -67,12 +67,34 @@ die(const char *fmt,...)
 }
 
 static bool
+parse_uint32_component(const char **str, int base, uint32 *value)
+{
+	const char *start = *str;
+	size_t		digits;
+	char	   *end;
+	unsigned long long parsed;
+
+	digits = strspn(start, base == 16 ?
+				 "0123456789abcdefABCDEF" : "0123456789");
+	if (digits == 0)
+		return false;
+	errno = 0;
+	parsed = strtoull(start, &end, base);
+	if (errno == ERANGE || parsed > 0xFFFFFFFFULL || end != start + digits)
+		return false;
+	*str = end;
+	*value = (uint32) parsed;
+	return true;
+}
+
+static bool
 parse_lsn(const char *str, XLogRecPtr *lsn)
 {
 	uint32		hi;
 	uint32		lo;
 
-	if (sscanf(str, "%X/%X", &hi, &lo) != 2)
+	if (!parse_uint32_component(&str, 16, &hi) || *str++ != '/' ||
+		!parse_uint32_component(&str, 16, &lo) || *str != '\0')
 		return false;
 
 	*lsn = ((uint64) hi << 32) | lo;
@@ -82,11 +104,13 @@ parse_lsn(const char *str, XLogRecPtr *lsn)
 static bool
 parse_relation(const char *str, RelFileLocator *rnode)
 {
-	unsigned int spc;
-	unsigned int db;
-	unsigned int rel;
+	uint32		spc;
+	uint32		db;
+	uint32		rel;
 
-	if (sscanf(str, "%u/%u/%u", &spc, &db, &rel) != 3)
+	if (!parse_uint32_component(&str, 10, &spc) || *str++ != '/' ||
+		!parse_uint32_component(&str, 10, &db) || *str++ != '/' ||
+		!parse_uint32_component(&str, 10, &rel) || *str != '\0')
 		return false;
 
 	rnode->spcOid = spc;
@@ -696,6 +720,7 @@ btree_block_number(XLogReaderState *record, uint8 id)
 	return blkno;
 }
 
+#if PG_VERSION_NUM >= 150000
 static void
 truncate_line_pointer_array(Page page)
 {
@@ -742,6 +767,7 @@ truncate_line_pointer_array(Page page)
 		phdr->pd_lower = new_lower;
 	}
 }
+#endif
 
 /* VACUUM's second pass does not compact tuple storage.  PostgreSQL also
  * retains one LP_UNUSED entry when every line pointer became unused. */
@@ -823,7 +849,9 @@ repair_page_fragmentation(Page page)
 
 	phdr->pd_upper = upper;
 
+#if PG_VERSION_NUM >= 150000
 	truncate_line_pointer_array(page);
+#endif
 	for (offnum = FirstOffsetNumber;
 		 offnum <= PageGetMaxOffsetNumber(page);
 		 offnum = OffsetNumberNext(offnum))
@@ -1101,9 +1129,14 @@ main(int argc, char **argv)
 				opts.has_relation = true;
 				break;
 			case 5:
-				if (sscanf(optarg, "%u", &opts.blkno) != 1)
+			{
+				const char *value = optarg;
+
+				if (!parse_uint32_component(&value, 10, &opts.blkno) ||
+					*value != '\0' || opts.blkno == InvalidBlockNumber)
 					die("invalid --block value: %s", optarg);
 				break;
+			}
 			case 6:
 				if (!parse_lsn(optarg, &opts.start_lsn))
 					die("invalid --start LSN: %s", optarg);
@@ -1113,9 +1146,14 @@ main(int argc, char **argv)
 					die("invalid --stop LSN: %s", optarg);
 				break;
 			case 8:
-				if (sscanf(optarg, "%u", &opts.timeline) != 1)
+			{
+				const char *value = optarg;
+
+				if (!parse_uint32_component(&value, 10, &opts.timeline) ||
+					*value != '\0')
 					die("invalid --tli value: %s", optarg);
 				break;
+			}
 			case 10:
 				opts.force_checksums = true;
 				break;
